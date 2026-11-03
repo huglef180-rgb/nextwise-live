@@ -1,0 +1,26 @@
+ticker,nom,poche,secteur,place,poids_cible,these,menace,sortie,evenement
+KBC.BR,KBC,Taux,Finance,Bruxelles,0.0414,"Banque-assurance belge très rentable, portée par des taux encore élevés.","Taxes bancaires belges, exposition à l'Europe centrale.",La BCE se met à baisser ses taux.,
+AI.PA,Air Liquide,Pouvoir de prix,Matériaux,Paris,0.0414,Gaz industriels sous contrats longs indexés sur le coût de l'énergie.,"Ralentissement de l'industrie européenne, action très suivie et chère.",Momentum négatif.,
+AM.PA,Dassault Aviation,Pouvoir de prix,Industrie,Paris,0.0414,"Carnet de commandes de plusieurs années (Rafale, Falcon).","Contrats d'export politiques, avenir du programme SCAF.",Annulation d'un gros contrat.,
+RACE.MI,Ferrari,Pouvoir de prix,Conso discrétionnaire,Milan,0.0414,Listes d'attente et hausses de prix sans perte de volume.,Croissance qui ralentit depuis les objectifs 2030 et livraisons en baisse au T2.,Baisse des commandes ou des livraisons.,Résultats du T3 le 3 novembre
+KRZ.IR,Kerry Group,Pouvoir de prix,Conso de base,Dublin,0.0414,"Ingrédients et arômes vendus aux industriels, coûts répercutés.","Volumes faibles chez ses clients, effet à long terme des médicaments anti-obésité.",Volumes en baisse deux trimestres d'affilée.,
+ACKB.BR,Ackermans & van Haaren,Électrification,Industrie,Bruxelles,0.0414,Holding familiale belge : DEME (éolien en mer) et la banque Delen.,"Décote de holding, coûts de l'éolien en mer.",Momentum sous le seuil d'alerte.,
+EQNR.OL,Equinor,Équilibre macro,Énergie,Oslo,0.0414,"Assurance contre un choc pétrolier, premier fournisseur de gaz de l'Europe.",Cessez-le-feu durable et normalisation du pétrole.,Cessez-le-feu durable.,
+MOWI.OL,Mowi,Stabilisateurs,Conso de base,Oslo,0.0414,"Cycle du saumon indépendant du reste, rebond attendu des bénéfices.","Prix du saumon volatils, taxe norvégienne, maladies.",Momentum sous le seuil d'alerte.,Rapport complet du T3 le 4 novembre
+REC.MI,Recordati,Pouvoir de prix,Santé,Milan,0.0414,"Maladies rares : peu de concurrence, prix protégés.",Génériques sur un produit clé.,Génériques sur un produit clé.,
+ELI.BR,Elia,Électrification,Utilities,Bruxelles,0.0414,"Réseau électrique régulé, investissements garantis.",Augmentations de capital qui diluent.,Augmentation de capital.,
+ABI.BR,AB InBev,Pouvoir de prix,Conso de base,Bruxelles,0.0414,"Marques mondiales, désendettement qui soutient le bénéfice par action.","Chine en forte baisse, États-Unis en recul.",Résultats décevants ou marges en baisse.,
+KIN.BR,Kinepolis,Croissance propre,Services de communication,Bruxelles,0.0414,Fréquentation des cinémas en reprise.,"Un trimestre sans gros films, streaming.",Mauvais box-office du trimestre.,
+KPN.AS,KPN,Stabilisateurs,Services de communication,Amsterdam,0.0414,"Bêta très bas, revenus d'abonnements, dividende en hausse depuis 9 ans.","Croissance faible, concurrence sur les prix.",Momentum sous −10 % au rééquilibrage.,
+ARGX.BR,argenx,Croissance propre,Santé,Bruxelles,0.025,Médicament phare en forte croissance (maladies auto-immunes).,"Dépend d'un seul produit, étude UNITY arrêtée en octobre.",Échec de l'étude EMPASSION.,Résultats de l'étude EMPASSION en décembre
+ENX.PA,Euronext,Pouvoir de prix,Finance,Paris,0.0414,"Plus les marchés sont agités, plus les volumes augmentent.","Baisse des volumes, concurrence des plateformes alternatives.",Chute des volumes échangés.,
+STMPA.PA,STMicroelectronics,Croissance propre,Technologie,Paris,0.025,"Puces pour data centers, résultats du T3 au-dessus des attentes.","Ralentissement des dépenses IA, placement très encombré.",Résultats décevants.,
+NN.AS,NN Group,Taux,Finance,Amsterdam,0.0414,"Assureur vie et retraites, tendance continue.",Réforme des retraites néerlandaise.,La BCE se met à baisser ses taux.,
+ARCAD.AS,Arcadis,Électrification,Industrie,Amsterdam,0.0414,Ingénierie de l'eau et de l'adaptation au climat.,"Budgets publics, notamment aux États-Unis.",Momentum négatif au rééquilibrage.,
+EDP.LS,EDP,Électrification,Utilities,Lisbonne,0.0414,Un des plus grands producteurs d'éolien et de solaire.,"Croissance des bénéfices de 2 à 3 % par an, dette élevée, taux.",Résultats décevants ou hausse forte des taux longs.,Résultats sur neuf mois le 5 novembre
+UCG.MI,UniCredit,Taux,Finance,Milan,0.0414,La plus rentable des grandes banques européennes.,"Acquisitions risquées, dette italienne.",Écartement du spread italien.,
+G.MI,Generali,Taux,Finance,Milan,0.0414,"Premier assureur italien, peu volatil.",Dette italienne détenue en masse.,Écartement du spread italien.,
+PRY.MI,Prysmian,Électrification,Industrie,Milan,0.025,"Câbles pour les réseaux électriques et les data centers, trimestre record.","Prix du cuivre, retards de projets.",Résultats décevants.,
+RYA.IR,Ryanair,Équilibre macro,Industrie,Dublin,0.025,"Gagne en cas de détente sur le pétrole, le kérosène étant son premier coût.","Flambée du pétrole, retards de livraison Boeing.",Si Equinor sort.,
+KRX.IR,Kingspan,Électrification,Industrie,Dublin,0.0414,Isolation des bâtiments imposée par les normes énergétiques.,"Retournement de la construction, taux en hausse.",Retournement de la construction.,
+BVI.PA,Bureau Veritas,Pouvoir de prix,Industrie,Paris,0.0414,"Contrôles imposés par la réglementation, quel que soit le cycle.",Valorisation déjà élevée.,Momentum sous le seuil d'alerte.,

@@ -1,0 +1,137 @@
+ticker,nom,secteur,place,univers
+KBC.BR,KBC,Finance,Bruxelles,liste
+INGA.AS,ING,Finance,Amsterdam,liste
+ISP.MI,Intesa Sanpaolo,Finance,Milan,liste
+BNP.PA,BNP Paribas,Finance,Paris,liste
+AGS.BR,Ageas,Finance,Bruxelles,liste
+CS.PA,AXA,Finance,Paris,liste
+G.MI,Generali,Finance,Milan,liste
+ELI.BR,Elia,Utilities,Bruxelles,liste
+EDP.LS,EDP,Utilities,Lisbonne,liste
+ENEL.MI,Enel,Utilities,Milan,liste
+ENGI.PA,Engie,Utilities,Paris,liste
+EQNR.OL,Equinor,Énergie,Oslo,liste
+TTE.PA,TotalEnergies,Énergie,Paris,liste
+ENI.MI,Eni,Énergie,Milan,liste
+UCB.BR,UCB,Santé,Bruxelles,liste
+ARGX.BR,argenx,Santé,Bruxelles,liste
+SAN.PA,Sanofi,Santé,Paris,liste
+AD.AS,Ahold Delhaize,Conso de base,Amsterdam,liste
+HEIA.AS,Heineken,Conso de base,Amsterdam,liste
+JMT.LS,Jerónimo Martins,Conso de base,Lisbonne,liste
+MOWI.OL,Mowi,Conso de base,Oslo,liste
+RACE.MI,Ferrari,Conso discrétionnaire,Milan,liste
+RMS.PA,Hermès,Conso discrétionnaire,Paris,liste
+MC.PA,LVMH,Conso discrétionnaire,Paris,liste
+SAF.PA,Safran,Industrie,Paris,liste
+LDO.MI,Leonardo,Industrie,Milan,liste
+DG.PA,Vinci,Industrie,Paris,liste
+ASML.AS,ASML,Technologie,Amsterdam,liste
+CAP.PA,Capgemini,Technologie,Paris,liste
+STMPA.PA,STMicro,Technologie,Paris,liste
+KPN.AS,KPN,Services de communication,Amsterdam,liste
+TEL.OL,Telenor,Services de communication,Oslo,liste
+ORA.PA,Orange,Services de communication,Paris,liste
+WDP.BR,WDP,Immobilier,Bruxelles,liste
+ABN.AS,ABN AMRO,Finance,Amsterdam,liste
+NN.AS,NN Group,Finance,Amsterdam,liste
+AIR.PA,Airbus,Industrie,Paris,liste
+SU.PA,Schneider Electric,Industrie,Paris,liste
+ACKB.BR,Ackermans & van Haaren,Industrie,Bruxelles,liste
+EL.PA,EssilorLuxottica,Santé,Paris,liste
+PHIA.AS,Philips,Santé,Amsterdam,liste
+KER.PA,Kering,Conso discrétionnaire,Paris,liste
+MONC.MI,Moncler,Conso discrétionnaire,Milan,liste
+BC.MI,Brunello Cucinelli,Conso discrétionnaire,Milan,liste
+ADYEN.AS,Adyen,Finance,Amsterdam,liste
+BESI.AS,BE Semiconductor,Technologie,Amsterdam,liste
+DSY.PA,Dassault Systèmes,Technologie,Paris,liste
+ABI.BR,AB InBev,Conso de base,Bruxelles,liste
+SOLB.BR,Solvay,Matériaux,Bruxelles,liste
+AI.PA,Air Liquide,Matériaux,Paris,liste
+UMI.BR,Umicore,Matériaux,Bruxelles,liste
+AKZA.AS,Akzo Nobel,Matériaux,Amsterdam,liste
+GALP.LS,Galp,Énergie,Lisbonne,liste
+AKRBP.OL,Aker BP,Énergie,Oslo,liste
+TRN.MI,Terna,Utilities,Milan,liste
+AM.PA,Dassault Aviation,Industrie,Paris,liste
+KRZ.IR,Kerry Group,Conso de base,Dublin,liste
+REC.MI,Recordati,Santé,Milan,liste
+KIN.BR,Kinepolis,Services de communication,Bruxelles,liste
+ENX.PA,Euronext,Finance,Paris,liste
+ARCAD.AS,Arcadis,Industrie,Amsterdam,liste
+UCG.MI,UniCredit,Finance,Milan,liste
+PRY.MI,Prysmian,Industrie,Milan,liste
+RYA.IR,Ryanair,Industrie,Dublin,liste
+KRX.IR,Kingspan,Industrie,Dublin,liste
+BVI.PA,Bureau Veritas,Industrie,Paris,liste
+OR.PA,L'Oréal,Conso de base,Paris,large
+BN.PA,Danone,Conso de base,Paris,large
+RI.PA,Pernod Ricard,Conso de base,Paris,large
+CA.PA,Carrefour,Conso de base,Paris,large
+SGO.PA,Saint-Gobain,Industrie,Paris,large
+LR.PA,Legrand,Industrie,Paris,large
+ML.PA,Michelin,Conso discrétionnaire,Paris,large
+RNO.PA,Renault,Conso discrétionnaire,Paris,large
+STLAP.PA,Stellantis,Conso discrétionnaire,Paris,large
+ACA.PA,Crédit Agricole,Finance,Paris,large
+GLE.PA,Société Générale,Finance,Paris,large
+PUB.PA,Publicis,Services de communication,Paris,large
+HO.PA,Thales,Industrie,Paris,large
+ERF.PA,Eurofins Scientific,Santé,Paris,large
+SW.PA,Sodexo,Conso discrétionnaire,Paris,large
+EN.PA,Bouygues,Industrie,Paris,large
+AC.PA,Accor,Conso discrétionnaire,Paris,large
+URW.PA,Unibail-Rodamco-Westfield,Immobilier,Paris,large
+VIE.PA,Veolia,Utilities,Paris,large
+ALO.PA,Alstom,Industrie,Paris,large
+TEP.PA,Teleperformance,Industrie,Paris,large
+BIM.PA,bioMérieux,Santé,Paris,large
+RXL.PA,Rexel,Industrie,Paris,large
+AMUN.PA,Amundi,Finance,Paris,large
+SCR.PA,SCOR,Finance,Paris,large
+WKL.AS,Wolters Kluwer,Industrie,Amsterdam,large
+RAND.AS,Randstad,Industrie,Amsterdam,large
+ASM.AS,ASM International,Technologie,Amsterdam,large
+PRX.AS,Prosus,Conso discrétionnaire,Amsterdam,large
+UMG.AS,Universal Music Group,Services de communication,Amsterdam,large
+IMCD.AS,IMCD,Industrie,Amsterdam,large
+AGN.AS,Aegon,Finance,Amsterdam,large
+ASRNL.AS,ASR Nederland,Finance,Amsterdam,large
+DSFIR.AS,DSM-Firmenich,Matériaux,Amsterdam,large
+EXO.AS,Exor,Finance,Amsterdam,large
+SOF.BR,Sofina,Finance,Bruxelles,large
+GBLB.BR,GBL,Finance,Bruxelles,large
+COLR.BR,Colruyt,Conso de base,Bruxelles,large
+AED.BR,Aedifica,Immobilier,Bruxelles,large
+LOTB.BR,Lotus Bakeries,Conso de base,Bruxelles,large
+SYENS.BR,Syensqo,Matériaux,Bruxelles,large
+PROX.BR,Proximus,Services de communication,Bruxelles,large
+DIE.BR,D'Ieteren,Conso discrétionnaire,Bruxelles,large
+BEKB.BR,Bekaert,Matériaux,Bruxelles,large
+TIT.MI,Telecom Italia,Services de communication,Milan,large
+SRG.MI,Snam,Utilities,Milan,large
+PST.MI,Poste Italiane,Finance,Milan,large
+MB.MI,Mediobanca,Finance,Milan,large
+BAMI.MI,Banco BPM,Finance,Milan,large
+CPR.MI,Campari,Conso de base,Milan,large
+PIRC.MI,Pirelli,Conso discrétionnaire,Milan,large
+AMP.MI,Amplifon,Santé,Milan,large
+DIA.MI,DiaSorin,Santé,Milan,large
+FBK.MI,FinecoBank,Finance,Milan,large
+HER.MI,Hera,Utilities,Milan,large
+IP.MI,Interpump,Industrie,Milan,large
+BIRG.IR,Bank of Ireland,Finance,Dublin,large
+A5G.IR,AIB Group,Finance,Dublin,large
+GL9.IR,Glanbia,Conso de base,Dublin,large
+DNB.OL,DNB Bank,Finance,Oslo,large
+NHY.OL,Norsk Hydro,Matériaux,Oslo,large
+YAR.OL,Yara,Matériaux,Oslo,large
+ORK.OL,Orkla,Conso de base,Oslo,large
+KOG.OL,Kongsberg Gruppen,Industrie,Oslo,large
+SALM.OL,SalMar,Conso de base,Oslo,large
+STB.OL,Storebrand,Finance,Oslo,large
+GJF.OL,Gjensidige,Finance,Oslo,large
+EDPR.LS,EDP Renováveis,Utilities,Lisbonne,large
+BCP.LS,Millennium bcp,Finance,Lisbonne,large
+NOS.LS,NOS,Services de communication,Lisbonne,large
