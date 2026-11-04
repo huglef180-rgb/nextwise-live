@@ -19,6 +19,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+import analyses as A
+
 print("[nextwise] imports terminés", flush=True)
 
 try:
@@ -137,7 +139,8 @@ def charger_tables():
     for c in ["date", "ticker", "type", "quantite", "prix", "frais", "commentaire"]:
         if c not in tx.columns:
             tx[c] = None
-    for c in ["ticker", "nom", "poche", "secteur", "place", "poids_cible", "these", "menace", "sortie", "evenement", "devise"]:
+    for c in ["ticker", "nom", "poche", "secteur", "place", "poids_cible", "these", "menace", "sortie", "evenement", "devise",
+              "type_valo", "per", "croissance", "peg", "lynch", "roe", "dette", "moat", "binaire"]:
         if c not in li.columns:
             li[c] = None
     tx["ticker"] = tx["ticker"].fillna("").str.strip().str.upper()
@@ -152,7 +155,9 @@ def charger_tables():
     tx = tx.sort_values("date", kind="stable").reset_index(drop=True)
     li["ticker"] = li["ticker"].fillna("").str.strip().str.upper()
     li = li[li["ticker"] != ""].drop_duplicates("ticker", keep="last").set_index("ticker")
-    li["poids_cible"] = li["poids_cible"].map(num)
+    for c in ["poids_cible", "per", "croissance", "peg", "lynch", "roe", "dette"]:
+        li[c] = li[c].map(num)
+    li["binaire"] = pd.to_datetime(li["binaire"], format="%Y-%m-%d", errors="coerce")
     return tx, li, source
 
 
@@ -392,6 +397,35 @@ def contraintes(df):
     return pd.DataFrame(rows)
 
 
+TABLE_CSS = """<style>
+.nwt {overflow-x:auto; margin-bottom:0.5rem}
+.nwt table {border-collapse:collapse; font-size:0.86rem; width:100%; font-variant-numeric:tabular-nums}
+.nwt th {text-align:left; padding:6px 10px; border-bottom:1px solid rgba(128,128,128,.45); white-space:nowrap; font-weight:600}
+.nwt td {padding:5px 10px; border-bottom:1px solid rgba(128,128,128,.18); white-space:nowrap}
+.nwt tbody tr:hover td, .nwt tbody tr:hover th {background:rgba(128,128,128,.10)}
+</style>"""
+
+
+def tableau(data, column_config=None, hide_index=None, height=None, **_):
+    """Tableau HTML statique : il s'affiche sans composant chargé à la demande par le navigateur,
+    donc il ne peut pas « échouer ». Accepte les mêmes arguments que les appels st.dataframe d'origine."""
+    sty = data if hasattr(data, "relabel_index") and hasattr(data, "to_html") else data.style.format(na_rep="")
+    noms = []
+    for c in sty.data.columns:
+        lab = (column_config or {}).get(c, c)
+        noms.append(lab if isinstance(lab, str) else str(c))
+    sty = sty.relabel_index(noms, axis="columns")
+    if hide_index:
+        sty = sty.hide(axis="index")
+    else:
+        nom_index = (column_config or {}).get(sty.data.index.name)
+        sty = sty.hide(axis="index", names=True)
+        if isinstance(nom_index, str) or sty.data.index.name:
+            sty = sty.hide(axis="index", names=False)
+            sty.data.index.name = nom_index if isinstance(nom_index, str) else sty.data.index.name
+    st.html(TABLE_CSS + '<div class="nwt">' + sty.to_html() + "</div>")
+
+
 def couleur_etat(v):
     return {"Dépassée": f"color:{C_MAUVAIS};font-weight:600", "Proche": f"color:{C_ATTENTION};font-weight:600",
             "Respectée": f"color:{C_BON}"}.get(v, "")
@@ -484,9 +518,24 @@ def simuler(tx, univ, debut, fin, n=10_000, graine=42):
     r_moi = float(w_moi @ rend)
     v_moi = float(np.sqrt(w_moi @ cov @ w_moi))
     b = p1.get(BENCH_PRINCIPAL, np.nan) / p0.get(BENCH_PRINCIPAL, np.nan) - 1
+    # --- étape 1 bis : tableau de survie mois par mois (Tarnavskyi, 2020)
+    survie = A.tableau_survie(W, ad[ok], ad[BENCH_PRINCIPAL], w_moi, debut, fin) if BENCH_PRINCIPAL in ad else pd.DataFrame()
+    # --- portefeuilles jumeaux (Daniel et al., 1997 ; Heyman et al., 2014)
+    h = ad.loc[:debut]
+    mom = {}
+    for t in ok:
+        s_ = h[t].dropna()
+        mom[t] = s_.iloc[-22] / s_.iloc[-253] - 1 if len(s_) > 253 else np.nan
+    car = pd.DataFrame({"secteur": sect, "mom": pd.Series(mom).reindex(ok).values, "vol": ewma}, index=ok)
+    car["mom_q"] = pd.qcut(car["mom"].rank(method="first"), 3, labels=False).fillna(-1)
+    car["vol_q"] = pd.qcut(car["vol"].rank(method="first"), 3, labels=False)
+    w_s = pd.Series(w_moi, index=ok)
+    w_s = w_s[w_s > 0]
+    garde = sorted(set(car.index[idx_u]) | set(w_s.index))
+    jum = A.jumeaux(car.loc[garde], w_s, pd.Series(rend, index=ok), n=n)
     return {"r_alea": r_alea, "v_alea": v_alea, "r_moi": r_moi, "v_moi": v_moi, "n_lignes": n_lignes,
             "investi": investi, "univers_n": len(idx_u), "exclus_moi": exclus_moi, "incomplets": incomplets,
-            "bench": b, "debut": debut, "fin": fin}
+            "bench": b, "debut": debut, "fin": fin, "survie": survie, "jumeaux": jum}
 
 
 # ================================================================== PAGE
@@ -496,7 +545,7 @@ st.session_state["_derniere_maj"] = dt.datetime.now().timestamp()
 @st.fragment(run_every=60)
 def actualisation_auto():
     """Relance toute la page chaque minute pour reprendre les cours (si l'option est cochée)."""
-    if st.session_state.get("auto", True) and dt.datetime.now().timestamp() - st.session_state.get("_derniere_maj", 0) > 55:
+    if st.session_state.get("auto", True) and st.session_state.get("page", "Direct") == "Direct" and dt.datetime.now().timestamp() - st.session_state.get("_derniere_maj", 0) > 55:
         st.rerun()
 
 
@@ -525,7 +574,7 @@ with st.sidebar:
     st.caption("Cours : Yahoo Finance, différés d'environ 15 minutes, convertis en euros.")
     if MOCK:
         st.warning("Mode test : cours simulés.")
-    st.toggle("Actualiser chaque minute", value=True, key="auto")
+    st.checkbox("Actualiser chaque minute (page Direct)", value=True, key="auto")
     actualisation_auto()
     if st.button("Rafraîchir les cours maintenant"):
         intraday.clear()
@@ -564,7 +613,8 @@ def instantane_direct():
     titres = pf["valeur"].sum(skipna=True)
     total = titres + cash
     pf["poids"] = pf["valeur"] / total
-    for c in ["nom", "poche", "secteur", "place", "poids_cible", "these", "menace", "sortie", "evenement"]:
+    for c in ["nom", "poche", "secteur", "place", "poids_cible", "these", "menace", "sortie", "evenement",
+              "type_valo", "per", "croissance", "peg", "lynch", "roe", "dette", "moat", "binaire"]:
         pf[c] = [lignes[c].get(t) if t in lignes.index else None for t in pf.index]
     pf["nom"] = [n if isinstance(n, str) and n else t for t, n in zip(pf.index, pf["nom"])]
     return pf, total, titres, intra_eur, dernier, veille, heure
@@ -577,6 +627,82 @@ poids = pf["poids"].dropna()
 risque = risque_portefeuille(poids, adj_eur, BENCH_PRINCIPAL)
 
 # ---------------------------------------------------------------- alertes
+REGLES_TEXTE = [
+    ("Entrée", "Momentum 12-1 mois", "positif"),
+    ("Entrée", "Plus forte hausse sur un jour le mois dernier (effet loterie)", "8 % au plus"),
+    ("Entrée", "ROE / dette nette sur Ebitda", "10 % au moins / 3 au plus (hors finance et utilities)"),
+    ("Entrée", "Valorisation", "PEG ≤ 2 (croissance) ou ratio de Lynch ≥ 1 (croissance lente) ; cycliques et financières jugées à part"),
+    ("Entrée", "Corrélation avec chaque autre ligne", "moins de 0,7"),
+    ("Entrée", "Thèse, menace et condition de sortie", "écrites avant l'achat"),
+    ("Lignes risquées", "Vol EWMA au-dessus de 40 % : poids", "2,5 %"),
+    ("Lignes risquées", "Vol EWMA au-dessus de 40 % : conditions", "moat identifié, ROE ≥ 15 %, momentum positif, pas d'événement binaire avant le prochain rééquilibrage (sinon poids ≤ 1,5 %)"),
+    ("Taille", "Poids de base", "98 % ÷ nombre de lignes, 4,5 % au plus à l'achat"),
+    ("Portefeuille", "UCITS 5/10/40", "toujours respecté ; rééquilibrage anticipé si les lignes au-dessus de 5 % dépassent 35 %"),
+    ("Portefeuille", "Secteur", "20 % du capital et 30 % du risque au plus"),
+    ("Portefeuille", "Place de cotation", "30 % au plus"),
+    ("Portefeuille", "Bêta", "entre 0,6 et 0,85"),
+    ("Portefeuille", "Volatilité prévue", "18 % au plus, sinon cash jusqu'à 10 %"),
+    ("Sortie", "Condition de sortie atteinte", "vente dans les 2 jours de bourse"),
+    ("Sortie", "Momentum sous −20 %, cas 3, contrainte non respectée", "vente au rééquilibrage mensuel"),
+    ("Sortie", "Prix d'achat", "n'entre dans aucune décision (effet de disposition)"),
+    ("Discipline", "Exception", "écrite dans le journal avant d'agir, avec une date de réexamen"),
+    ("Discipline", "Test de la page blanche", "chaque mois : mes règles me la feraient-elles acheter aujourd'hui ?"),
+]
+
+
+def verifier_regles(pf, corr):
+    """Vérifie chaque ligne contre les règles écrites. ✓ respectée, ✗ non respectée, – sans objet."""
+    ok, ko, na = "✓", "✗", "–"
+    aujourdhui = pd.Timestamp.now(tz=TZ).normalize().tz_localize(None)
+    prochain_reeq = (aujourdhui + pd.offsets.MonthBegin(1))
+    rows = []
+    for t, r in pf.iterrows():
+        typ = r.get("type_valo") or ""
+        sect = r.get("secteur") or ""
+        mom, roe, dette, peg, lynch = r.get("momentum"), r.get("roe"), r.get("dette"), r.get("peg"), r.get("lynch")
+        def test(cond):
+            return na if cond is None else (ok if cond else ko)
+        valo = None
+        if typ == "Croissance" and pd.notna(peg):
+            valo = peg <= 2
+        elif typ == "Croissance lente" and pd.notna(lynch):
+            valo = lynch >= 1
+        cmax = np.nan
+        if corr is not None and t in corr.index:
+            cc = corr.loc[t].drop(t, errors="ignore")
+            cmax = cc.max() if len(cc) else np.nan
+        risquee = pd.notna(r.get("vol_ewma")) and r["vol_ewma"] > LIM["vol_reduite"]
+        manque = []
+        if risquee:
+            if not (isinstance(r.get("moat"), str) and r["moat"].strip()):
+                manque.append("pas de moat identifié")
+            if not (pd.notna(roe) and roe >= 0.15):
+                manque.append("ROE sous 15 %")
+            if not (pd.notna(mom) and mom > 0):
+                manque.append("momentum négatif")
+            b = r.get("binaire")
+            if pd.notna(b) and aujourdhui <= b <= prochain_reeq + pd.Timedelta(days=31) and r["poids"] > 0.015:
+                manque.append(f"événement binaire le {pd.Timestamp(b):%d/%m} avec un poids de {pct(r['poids'])}")
+        rows.append({
+            "ticker": t, "nom": r["nom"],
+            "momentum": test(None if pd.isna(mom) else mom > 0),
+            "loterie": test(None if pd.isna(r.get("max_jour")) else r["max_jour"] <= 0.08),
+            "roe": test(None if pd.isna(roe) else roe >= 0.10),
+            "dette": test(None if (typ == "Financière" or sect == "Utilities" or pd.isna(dette)) else dette <= 3),
+            "valorisation": test(valo),
+            "correlation": test(None if pd.isna(cmax) else cmax < 0.7),
+            "taille": test(None if pd.isna(r["poids"]) else r["poids"] <= (0.025 + 0.005 if risquee else 0.05)),
+            "ligne_risquee": (ko if manque else ok) if risquee else na,
+            "detail_risquee": " ; ".join(manque),
+            "corr_max": cmax,
+        })
+    out = pd.DataFrame(rows).set_index("ticker")
+    out["ecarts"] = (out[["momentum", "loterie", "roe", "dette", "valorisation", "correlation", "taille", "ligne_risquee"]] == ko).sum(axis=1)
+    return out
+
+
+regles_lignes = verifier_regles(pf, risque["corr"] if risque else None)
+
 alertes = []
 for t, r in pf.iterrows():
     if pd.isna(r["cours"]):
@@ -590,6 +716,11 @@ for t, r in pf.iterrows():
         alertes.append(("warn", f"{r['nom']} : vol EWMA {pct(r['vol_ewma'], 0)}, poids {pct(r['poids'])} au-dessus des 2,5 % prévus."))
     if t not in lignes.index or not isinstance(lignes.loc[t, "these"], str) or not lignes.loc[t, "these"].strip():
         alertes.append(("warn", f"{r['nom']} : fiche à compléter (thèse, menace, condition de sortie) dans l'onglet « lignes »."))
+for t, rg in regles_lignes.iterrows():
+    if rg["ligne_risquee"] == "✗":
+        alertes.append(("warn", f"{rg['nom']} : ligne risquée qui ne remplit pas la règle ({rg['detail_risquee']})."))
+    if rg["roe"] == "✗":
+        alertes.append(("warn", f"{rg['nom']} : ROE sous 10 %, contraire à ta règle de qualité."))
 cons = contraintes(pf.dropna(subset=["poids"]))
 for _, c in cons.iterrows():
     if c["etat"] == "Dépassée":
@@ -618,10 +749,49 @@ k[3].metric("Cash", eur(cash), f"{pct(cash / total)} du total", delta_color="off
 if risque:
     k[4].metric("Volatilité prévue", pct(risque["vol"]), f"bêta {risque['beta']:.2f}".replace(".", ","), delta_color="off")
 
-onglets = st.tabs(["Direct", "Lignes", "Performance", "Risque", "Simulateur", "Stress tests", "Chance ou talent", "Journal", "Données"])
+PAGES = ["Direct", "Lignes", "Performance", "Risque", "Momentum", "Régime", "Simulateur", "Stress tests", "Chance ou talent", "Règles", "Journal", "Données"]
+page = st.radio("Page", PAGES, horizontal=True, key="page", label_visibility="collapsed")
+st.divider()
+
+def serie_portefeuille():
+    """Valeur quotidienne du portefeuille réel et rendements pondérés par le temps (les apports ne comptent pas comme gain)."""
+    debut = tx["date"].dropna().min()
+    jours = close_eur.index[close_eur.index >= debut]
+    if not len(jours):
+        return None
+    qte = pd.DataFrame(0.0, index=jours, columns=tickers_tous)
+    cash_j = pd.Series(0.0, index=jours)
+    apport_j = pd.Series(0.0, index=jours)
+    for _, rr in tx.iterrows():
+        if pd.isna(rr["date"]):
+            continue
+        m = jours >= rr["date"]
+        typ, t, q, p, f = rr["type"], rr["ticker"], rr["quantite"], rr["prix"], rr["frais"]
+        if typ == "apport":
+            cash_j[m] += p; apport_j[m] += p
+        elif typ == "retrait":
+            cash_j[m] -= p; apport_j[m] -= p
+        elif typ == "achat" and t:
+            qte.loc[m, t] += q; cash_j[m] -= q * p + f
+        elif typ == "vente" and t:
+            qte.loc[m, t] -= q; cash_j[m] += q * p - f
+        elif typ == "frais":
+            cash_j[m] -= f if f else (p if pd.notna(p) else 0)
+        elif typ == "dividende":
+            cash_j[m] += ((q * p) if pd.notna(q) and pd.notna(p) else (p if pd.notna(p) else 0)) - f
+    px_j = close_eur.reindex(jours)[tickers_tous].ffill()
+    valeur_j = (qte * px_j).sum(axis=1, min_count=1).fillna(0) + cash_j
+    if jours[-1] >= pd.Timestamp.now(tz=TZ).normalize().tz_localize(None):
+        valeur_j.iloc[-1] = total
+    flux = apport_j.diff().fillna(apport_j.iloc[0])
+    rend = (valeur_j - flux) / valeur_j.shift(1) - 1
+    rend.iloc[0] = valeur_j.iloc[0] / apport_j.iloc[0] - 1 if apport_j.iloc[0] else 0
+    indice = (1 + rend.fillna(0)).cumprod()
+    return {"jours": jours, "valeur": valeur_j, "rend": rend, "indice": indice}
+
 
 # ================================================================== DIRECT
-with onglets[0]:
+if page == "Direct":
     g, d = st.columns([3, 2])
     with g:
         st.subheader("Carte du portefeuille")
@@ -644,7 +814,7 @@ with onglets[0]:
         for niveau, texte in sorted(alertes, key=lambda a: a[0] != "bad")[:12]:
             (st.error if niveau == "bad" else st.warning)(texte)
         st.subheader("Contraintes")
-        st.dataframe(
+        tableau(
             cons.style.format({"niveau": lambda v: pct(v), "limite": lambda v: "≤ " + pct(v, 0)}).map(couleur_etat, subset=["etat"]),
             hide_index=True, column_config={"regle": "Règle", "niveau": "Niveau", "limite": "Limite", "etat": "État"})
 
@@ -675,7 +845,7 @@ with onglets[0]:
     st.plotly_chart(fig, key="varjour")
 
 # ================================================================== LIGNES
-with onglets[1]:
+if page == "Lignes":
     st.subheader("Toutes les lignes")
     poches = ["Toutes"] + sorted(pf["poche"].dropna().unique().tolist())
     choix = st.selectbox("Poche", poches)
@@ -684,7 +854,7 @@ with onglets[1]:
                  "momentum", "vol_ewma", "beta", "haut52"]].copy()
     if risque:
         table["part_risque"] = risque["contrib"].reindex(table.index)
-    st.dataframe(
+    tableau(
         table.sort_values("poids", ascending=False).style.format({
             "quantite": "{:g}", "pru": lambda v: eur(v, 2), "cours": lambda v: eur(v, 2), "var_jour": lambda v: pct(v, 2, True),
             "valeur": lambda v: eur(v), "poids": lambda v: pct(v), "latent": lambda v: eur(v), "latent_pct": lambda v: pct(v, 1, True),
@@ -722,39 +892,11 @@ with onglets[1]:
             st.markdown(f"**{titre}** : {v if isinstance(v, str) and v.strip() else '*à compléter*'}")
 
 # ================================================================== PERFORMANCE
-with onglets[2]:
+if page == "Performance":
     st.subheader("Valeur du portefeuille depuis le départ")
-    debut = tx["date"].dropna().min()
-    jours = close_eur.index[close_eur.index >= debut]
-    if len(jours):
-        qte = pd.DataFrame(0.0, index=jours, columns=tickers_tous)
-        cash_j = pd.Series(0.0, index=jours)
-        apport_j = pd.Series(0.0, index=jours)
-        for _, rr in tx.iterrows():
-            if pd.isna(rr["date"]):
-                continue
-            m = jours >= rr["date"]
-            typ, t, q, p, f = rr["type"], rr["ticker"], rr["quantite"], rr["prix"], rr["frais"]
-            if typ == "apport":
-                cash_j[m] += p; apport_j[m] += p
-            elif typ == "retrait":
-                cash_j[m] -= p; apport_j[m] -= p
-            elif typ == "achat" and t:
-                qte.loc[m, t] += q; cash_j[m] -= q * p + f
-            elif typ == "vente" and t:
-                qte.loc[m, t] -= q; cash_j[m] += q * p - f
-            elif typ == "frais":
-                cash_j[m] -= f if f else (p if pd.notna(p) else 0)
-            elif typ == "dividende":
-                cash_j[m] += ((q * p) if pd.notna(q) and pd.notna(p) else (p if pd.notna(p) else 0)) - f
-        px_j = close_eur.reindex(jours)[tickers_tous].ffill()
-        valeur_j = (qte * px_j).sum(axis=1, min_count=1).fillna(0) + cash_j
-        # aujourd'hui : valeur en direct
-        valeur_j.iloc[-1] = total if jours[-1] >= pd.Timestamp.now(tz=TZ).normalize().tz_localize(None) else valeur_j.iloc[-1]
-        flux = apport_j.diff().fillna(apport_j.iloc[0])
-        rend = (valeur_j - flux) / valeur_j.shift(1) - 1
-        rend.iloc[0] = valeur_j.iloc[0] / apport_j.iloc[0] - 1 if apport_j.iloc[0] else 0
-        indice = (1 + rend.fillna(0)).cumprod()
+    sp = serie_portefeuille()
+    if sp:
+        jours, rend, indice = sp["jours"], sp["rend"], sp["indice"]
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=indice.index, y=indice - 1, name="Portefeuille", line=dict(width=2.5)))
         for bt, bn in BENCH.items():
@@ -796,12 +938,12 @@ with onglets[2]:
     gp = pf.groupby(pf["poche"].fillna("Sans poche")).agg(valeur=("valeur", "sum"), latent=("latent", "sum"), cout=("pru", lambda s: (s * pf.loc[s.index, "quantite"]).sum()))
     gp["poids"] = gp["valeur"] / total
     gp["rendement"] = gp["latent"] / gp["cout"]
-    st.dataframe(gp[["poids", "valeur", "latent", "rendement"]].sort_values("poids", ascending=False).style.format(
+    tableau(gp[["poids", "valeur", "latent", "rendement"]].sort_values("poids", ascending=False).style.format(
         {"poids": lambda v: pct(v), "valeur": lambda v: eur(v), "latent": lambda v: eur(v), "rendement": lambda v: pct(v, 1, True)}).map(signe_couleur, subset=["latent", "rendement"]),
         column_config={"poche": "Poche", "poids": "Poids", "valeur": "Valeur", "latent": "Latent", "rendement": "Rendement"})
 
 # ================================================================== RISQUE
-with onglets[3]:
+if page == "Risque":
     if not risque:
         st.info("Pas assez d'historique pour calculer le risque.")
     else:
@@ -855,8 +997,217 @@ with onglets[3]:
             (a1, a2), v = m.idxmax(), m.max()
             st.caption(f"Paire la plus corrélée : {pf['nom'].get(a1, a1)} et {pf['nom'].get(a2, a2)} ({v:.2f}).".replace(".", ",", 1))
 
+# ================================================================== MOMENTUM
+@st.cache_data(ttl=3600, show_spinner="Cours de l'univers…")
+def prix_univers(liste_seule=True):
+    u = charger_univers()
+    if liste_seule:
+        u = u[u["univers"] == "liste"]
+    dev = {t: devise_de(t) for t in u.index}
+    pr = sorted({("EURGBP=X" if d == "GBp" else f"EUR{d}=X") for d in dev.values() if d != "EUR"})
+    _, ad = historique(tuple(sorted(set(u.index) | set(pr) | {BENCH_PRINCIPAL})))
+    ad = en_euros(ad, dev)
+    return ad[[c for c in ad.columns if c in u.index]], ad[BENCH_PRINCIPAL] if BENCH_PRINCIPAL in ad else None, u
+
+
+@st.cache_data(ttl=3600, show_spinner="Calcul des signaux de momentum…")
+def signaux_cache(prix, bench):
+    return A.signaux_momentum(prix, bench)
+
+
+@st.cache_data(ttl=3600, show_spinner="Construction du facteur momentum européen…")
+def wml_cache(prix):
+    return A.facteur_momentum(prix)
+
+
+if page == "Momentum":
+    st.subheader("Momentum et tendance")
+    st.caption("Le momentum est l'une des anomalies les plus solides de la finance, mais à un horizon précis : les gagnants des 3 à 12 derniers mois "
+               "continuent de gagner (Jegadeesh et Titman, 1993 ; Rouwenhorst, 1998 en Europe), alors que sur un mois, c'est l'inverse : les plus fortes "
+               "hausses ont tendance à reculer (Jegadeesh, 1990). Cette page sépare les deux.")
+    lignes_p = [t for t in pf.index if t in adj_eur.columns]
+    if BENCH_PRINCIPAL not in adj_eur:
+        st.error("Indice de référence indisponible.")
+    else:
+        sg = signaux_cache(adj_eur[lignes_p], adj_eur[BENCH_PRINCIPAL])
+        sg["nom"] = pf["nom"].reindex(sg.index)
+        sg["poids"] = pf["poids"].reindex(sg.index)
+        sg = sg.sort_values("score", ascending=False)
+        st.markdown("### Tes lignes, classées par score de momentum")
+        st.caption("Le score combine quatre signaux, chacun ramené à la même échelle : momentum résiduel, momentum intermédiaire, proximité du plus haut "
+                   "sur 52 semaines et régularité de la hausse. Plus il est élevé, plus la tendance de la ligne est solide.")
+        tb = sg[["nom", "score", "mom_resid", "mom_12_7", "mom_12_1", "id_fip", "haut52", "tendance_10m", "rend_1m", "poids"]].copy()
+
+        def c_score(v):
+            return "" if pd.isna(v) else (f"color:{C_BON};font-weight:600" if v > 0.5 else (f"color:{C_MAUVAIS};font-weight:600" if v < -0.5 else ""))
+
+        def c_inv(v):
+            return f"color:{C_ATTENTION};font-weight:600" if pd.notna(v) and v > 0.15 else ""
+
+        tableau(tb.style.format({"score": lambda v: "—" if pd.isna(v) else f"{v:+.2f}".replace(".", ","),
+                                 "mom_resid": lambda v: "—" if pd.isna(v) else f"{v:+.2f}".replace(".", ","),
+                                 "mom_12_7": lambda v: pct(v, 0, True), "mom_12_1": lambda v: pct(v, 0, True),
+                                 "id_fip": lambda v: "—" if pd.isna(v) else f"{v:+.2f}".replace(".", ","),
+                                 "haut52": lambda v: pct(v, 0), "tendance_10m": lambda v: ("au-dessus " if v > 0 else "en dessous ") + pct(v, 0, True) if pd.notna(v) else "—",
+                                 "rend_1m": lambda v: pct(v, 1, True), "poids": lambda v: pct(v)})
+                .map(c_score, subset=["score", "mom_resid"]).map(signe_couleur, subset=["mom_12_7", "mom_12_1", "tendance_10m"]).map(c_inv, subset=["rend_1m"]),
+                hide_index=True,
+                column_config={"nom": "Ligne", "score": "Score", "mom_resid": "Momentum résiduel", "mom_12_7": "Momentum 12-7", "mom_12_1": "Momentum 12-1",
+                               "id_fip": "Régularité (FIP)", "haut52": "% du plus haut 52 s.", "tendance_10m": "Cours / moyenne 10 mois",
+                               "rend_1m": "Dernier mois", "poids": "Poids"})
+        inv = sg[sg["rend_1m"] > 0.15]
+        if len(inv):
+            st.warning("Inversion à 1 mois : " + ", ".join(inv["nom"]) + " ont pris plus de 15 % le mois dernier. Historiquement, ces titres ont tendance "
+                       "à reculer le mois suivant : ce n'est pas le moment de les renforcer.")
+        sous = sg[sg["tendance_10m"] < 0]
+        if len(sous):
+            st.info("Sous leur moyenne sur 10 mois (Faber, 2007) : " + ", ".join(sous["nom"]) + ". La tendance de fond est baissière : à surveiller au rééquilibrage.")
+        with st.expander("Comment lire chaque colonne"):
+            st.markdown(
+                "- **Momentum résiduel** (Blitz, Huij et Martens, 2011) : la tendance propre à l'entreprise, une fois retiré l'effet du marché (régression sur 36 mois). "
+                "Presque aussi rentable que le momentum classique, avec environ deux fois moins de risque et beaucoup moins de krachs. Au-dessus de +1 : tendance propre forte.\n"
+                "- **Momentum 12-7** (Novy-Marx, 2012) : la performance d'il y a 7 à 12 mois, qui prédit mieux que celle des 6 derniers mois.\n"
+                "- **Momentum 12-1** : la mesure classique, sans le dernier mois.\n"
+                "- **Régularité (FIP)** (Da, Gurun et Warachka, 2014) : négatif = la hausse s'est faite par petites touches régulières, ce qui persiste davantage "
+                "qu'une hausse faite de quelques bonds, qui attire l'attention et se corrige.\n"
+                "- **% du plus haut 52 semaines** (George et Hwang, 2004) : près de 100 %, les investisseurs hésitent à acheter au sommet, ce qui retarde la hausse suivante.\n"
+                "- **Cours / moyenne 10 mois** (Faber, 2007 ; Moskowitz, Ooi et Pedersen, 2012) : au-dessus, la tendance de fond est haussière.\n"
+                "- **Dernier mois** : en orange au-delà de +15 %, risque d'inversion à court terme (Jegadeesh, 1990 ; Lehmann, 1990).")
+
+        st.markdown("### Le facteur momentum en Europe et son risque de krach")
+        st.caption("Chaque mois, on achète le tiers de ta liste de départ au meilleur momentum et on vend le tiers au plus faible. Ce portefeuille "
+                   "« gagnants − perdants » montre si le momentum fonctionne en ce moment sur ton univers.")
+        pu, bu, _ = prix_univers(True)
+        wml = wml_cache(pu)
+        if len(wml) > 60:
+            cumul = (1 + wml).cumprod() - 1
+            vol6 = wml.rolling(126).std() * np.sqrt(252)
+            g, d = st.columns(2)
+            with g:
+                fig = go.Figure(go.Scatter(x=cumul.index, y=cumul, line=dict(width=2), name="Gagnants − perdants"))
+                fig.add_hline(y=0, line_color="#bbbbbb", line_width=1)
+                fig.update_layout(height=280, yaxis_tickformat="+.0%", margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Rendement cumulé du facteur", font_size=13))
+                st.plotly_chart(fig, key="wml")
+            with d:
+                fig = go.Figure(go.Scatter(x=vol6.index, y=vol6, line=dict(width=2, color=C_ATTENTION)))
+                fig.update_layout(height=280, yaxis_tickformat=".0%", margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Volatilité du facteur sur 6 mois", font_size=13))
+                st.plotly_chart(fig, key="wmlvol")
+            kr = A.risque_krach_momentum(adj_eur[BENCH_PRINCIPAL], wml)
+            c = st.columns(4)
+            c[0].metric("Marché sur 2 ans", pct(kr["marche_2ans"], 0, True), "baissier : danger" if kr["marche_baissier"] else "pas baissier", delta_color="off")
+            c[1].metric("Volatilité du marché (6 mois)", pct(kr["vol_marche"], 0), f"seuil d'alerte {pct(kr['seuil_vol'], 0)}", delta_color="off")
+            c[2].metric("Volatilité du momentum (6 mois)", pct(kr["vol_wml"], 0))
+            c[3].metric("Exposition conseillée au momentum", "—" if pd.isna(kr["echelle_bsc"]) else f"{kr['echelle_bsc']:.1f}×".replace(".", ","),
+                        "Barroso et Santa-Clara (2015)", delta_color="off")
+            if kr["alerte"]:
+                st.error("Risque de krach du momentum : marché en baisse sur 2 ans et volatilité forte. C'est dans ce contexte que le momentum s'effondre, "
+                         "quand les perdants rebondissent violemment (Daniel et Moskowitz, 2016). Ne t'appuie pas sur le momentum pour tes prochains achats.")
+            else:
+                st.success("Pas de signal de krach du momentum : le contexte est normal pour utiliser ce signal.")
+            st.caption("L'exposition conseillée vise une volatilité de 12 % pour le facteur : au-dessus de 1, le momentum est calme et fiable ; "
+                       "en dessous, il faut lui donner moins de poids dans tes choix.")
+        else:
+            st.info("Pas assez d'historique pour construire le facteur.")
+        st.caption("Limites honnêtes : l'avantage des anomalies a baissé d'un tiers à la moitié après leur publication (McLean et Pontiff, 2016), "
+                   "et sur 25 lignes et 5 mois, le bruit domine. Le momentum sert à choisir et à contrôler, pas à promettre une performance.")
+
+# ================================================================== RÉGIME
+@st.cache_data(ttl=3600, show_spinner="Calcul du régime de marché…")
+def regime_cache(prix, secteurs):
+    r = A.rendements(prix)
+    sect = pd.DataFrame({s: r[[t for t in secteurs.index[secteurs == s] if t in r.columns]].mean(axis=1) for s in secteurs.unique()}).dropna(how="any")
+    sect = sect.loc[:, sect.std() > 0]
+    return sect, A.turbulence(sect), A.ratio_absorption(sect)
+
+
+if page == "Régime":
+    st.subheader("Régime de marché")
+    st.caption("Deux mesures de stress utilisées par les gérants institutionnels, calculées sur les secteurs de ta liste de départ, "
+               "et une mesure honnête de ta diversification.")
+    pu, bu, uu = prix_univers(True)
+    sect, turb, absr = regime_cache(pu, uu["secteur"].reindex(pu.columns).fillna("?"))
+    if len(turb) > 50:
+        st.markdown("### Indice de turbulence (Kritzman et Li, 2010)")
+        st.caption("Mesure à quel point les mouvements du jour entre secteurs sont inhabituels au vu de leurs corrélations de l'année passée. "
+                   "Une valeur élevée signale des journées anormales, typiques des débuts de crise.")
+        t20 = turb.rolling(20).mean()
+        p75, p95 = turb.quantile(0.75), turb.quantile(0.95)
+        actuel = float(t20.iloc[-1])
+        rang = float((turb <= actuel).mean())
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=turb.index, y=turb, line=dict(width=1, color="#c7c7c7"), name="Quotidien"))
+        fig.add_trace(go.Scatter(x=t20.index, y=t20, line=dict(width=2), name="Moyenne 20 jours"))
+        fig.add_hline(y=p75, line_dash="dot", line_color=C_ATTENTION, annotation_text="75e centile")
+        fig.add_hline(y=p95, line_dash="dot", line_color=C_MAUVAIS, annotation_text="95e centile")
+        fig.update_layout(height=300, margin=dict(t=10, l=0, r=0, b=0), legend=dict(orientation="h", y=1.12), yaxis_type="log")
+        st.plotly_chart(fig, key="turb")
+        c = st.columns(3)
+        c[0].metric("Turbulence actuelle (20 jours)", f"{actuel:.2f}".replace(".", ","), f"plus haut que {pct(rang, 0)} des jours", delta_color="off")
+        etat = "Calme" if actuel < p75 else ("Agité" if actuel < p95 else "Turbulent")
+        c[1].metric("État", etat)
+        c[2].metric("Seuil turbulent (95e centile)", f"{p95:.2f}".replace(".", ","))
+        st.caption("En régime turbulent, les corrélations montent et la diversification fond : c'est le moment de vérifier tes stress tests et ton cash.")
+    if len(absr) > 20:
+        st.markdown("### Ratio d'absorption (Kritzman, Li, Page et Rigobon, 2011)")
+        st.caption("La part de la variance de tous les secteurs expliquée par un ou deux facteurs communs. Quand il monte, les marchés sont « soudés » : "
+                   "un choc se propage partout. Les auteurs l'ont vu monter avant la plupart des grandes baisses.")
+        ar15, ar_an = absr.iloc[-3:].mean(), absr.iloc[-50:]
+        delta = (ar15 - ar_an.mean()) / ar_an.std() if ar_an.std() > 0 else np.nan
+        fig = go.Figure(go.Scatter(x=absr.index, y=absr, line=dict(width=2, color="#7b4ea3")))
+        fig.update_layout(height=260, yaxis_tickformat=".0%", margin=dict(t=10, l=0, r=0, b=0))
+        st.plotly_chart(fig, key="absr")
+        c = st.columns(2)
+        c[0].metric("Ratio d'absorption", pct(float(absr.iloc[-1]), 0))
+        c[1].metric("Écart à sa moyenne de l'année", "—" if pd.isna(delta) else f"{delta:+.1f} écart-type".replace(".", ","),
+                    "au-delà de +1 : fragilité" if pd.notna(delta) and delta > 1 else "normal", delta_color="off")
+    st.markdown("### Combien de paris fais-tu vraiment ?")
+    r1 = adj_eur.pct_change(fill_method=None).iloc[-252:]
+    enb = A.nombre_effectif_paris(poids, r1)
+    if enb:
+        c = st.columns(3)
+        c[0].metric("Lignes", enb["n_lignes"])
+        c[1].metric("Paris réellement indépendants", f"{enb['enb']:.1f}".replace(".", ","))
+        c[2].metric("Ratio de diversification", f"{enb['dr']:.2f}".replace(".", ","))
+        st.caption("Le nombre de paris indépendants est le carré du ratio de diversification (Choueifaty et Coignard, 2008). Tes lignes bougeant en partie "
+                   "ensemble, elles valent moins de paris que leur nombre. C'est la mesure à citer devant le jury plutôt que « 25 lignes ».")
+
+# ================================================================== RÈGLES
+if page == "Règles":
+    st.subheader("Règles et conformité")
+    st.markdown("### Chaque ligne passée au crible de tes règles")
+    st.caption("✓ respectée · ✗ non respectée · – sans objet (par exemple la dette pour une banque). Les règles d'entrée servent à acheter ; "
+               "une ligne déjà détenue qui en perd une est à réexaminer au prochain rééquilibrage, pas à vendre dans la minute.")
+    rl = regles_lignes.sort_values("ecarts", ascending=False).copy()
+
+    def c_sym(v):
+        return {"✓": f"color:{C_BON};font-weight:600", "✗": f"color:{C_MAUVAIS};font-weight:700"}.get(v, f"color:{C_NEUTRE}")
+
+    cols_r = ["momentum", "loterie", "roe", "dette", "valorisation", "correlation", "taille", "ligne_risquee"]
+    tableau(rl[["nom"] + cols_r + ["ecarts"]].style.map(c_sym, subset=cols_r), hide_index=True,
+            column_config={"nom": "Ligne", "momentum": "Momentum > 0", "loterie": "Hausse max ≤ 8 %", "roe": "ROE ≥ 10 %", "dette": "Dette ≤ 3",
+                           "valorisation": "Valorisation", "correlation": "Corrélation < 0,7", "taille": "Taille", "ligne_risquee": "Règle lignes risquées",
+                           "ecarts": "Écarts"})
+    det = rl[rl["detail_risquee"] != ""]
+    if len(det):
+        st.markdown("**Lignes risquées qui ne remplissent pas toutes les conditions**")
+        for _, r in det.iterrows():
+            st.markdown(f"- **{r['nom']}** : {r['detail_risquee']}.")
+    with st.expander("Moat retenu pour chaque ligne (à valider par toi)"):
+        mo = pf[["nom", "moat"]].copy()
+        mo["moat"] = mo["moat"].fillna("").replace("", "aucun moat clair")
+        tableau(mo, hide_index=True, column_config={"nom": "Ligne", "moat": "Source de l'avantage durable"})
+        st.caption("Les cinq sources de moat de Morningstar : avantage de coût, effet de réseau, coûts de changement, actifs immatériels, taille efficace. "
+                   "Modifie la colonne « moat » de lignes.csv si tu n'es pas d'accord.")
+    st.markdown("### Mes règles écrites")
+    tableau(pd.DataFrame(REGLES_TEXTE, columns=["domaine", "regle", "seuil"]), hide_index=True,
+            column_config={"domaine": "Domaine", "regle": "Critère", "seuil": "Seuil"})
+    st.markdown("### Pourquoi le moat sur les lignes risquées")
+    st.markdown("Les titres volatils et peu rentables ont des rendements futurs particulièrement mauvais (Ang et al., 2006 ; Asness, Frazzini et Pedersen, 2019), "
+                "et les titres « loterie » sous-performent (Bali, Cakici et Whitelaw, 2011). Exiger un avantage durable et une rentabilité élevée là où le risque "
+                "est le plus fort limite ce piège. Un narratif seul ne suffit pas : les actions « glamour » sous-performent (Lakonishok, Shleifer et Vishny, 1994).")
+
 # ================================================================== SIMULATEUR
-with onglets[4]:
+if page == "Simulateur":
     st.subheader("Tester un ordre avant de le passer")
     st.caption("Modifie les poids, ajoute une ligne avec son ticker Yahoo (ex. ENEL.MI) ou mets un poids à 0 pour une vente. Le reste va en cash.")
     base = pf[["nom", "poids", "secteur", "place"]].copy()
@@ -896,17 +1247,17 @@ with onglets[4]:
             c[3].metric("VaR 95 % sur un jour", pct(apres["var95"], 2), pct(apres["var95"] - risque["var95"], 2, True), delta_color="inverse")
             c[4].metric("Cash", pct(1 - w_sim.sum()), pct((1 - w_sim.sum()) - cash / total, 1, True), delta_color="off")
             cs = contraintes(edit[edit["poids"] > 0].set_index("ticker"))
-            st.dataframe(cs.style.format({"niveau": lambda v: pct(v), "limite": lambda v: "≤ " + pct(v, 0)}).map(couleur_etat, subset=["etat"]),
+            tableau(cs.style.format({"niveau": lambda v: pct(v), "limite": lambda v: "≤ " + pct(v, 0)}).map(couleur_etat, subset=["etat"]),
                          hide_index=True, column_config={"regle": "Règle après l'ordre", "niveau": "Niveau", "limite": "Limite", "etat": "État"})
             s_av, s_ap = stress(poids, adj_sim, BENCH_PRINCIPAL), stress(w_sim, adj_sim, BENCH_PRINCIPAL)
             if not s_av.empty and not s_ap.empty:
                 comp = s_av[["scenario", "portefeuille"]].merge(s_ap[["scenario", "portefeuille"]], on="scenario", suffixes=("_avant", "_apres"))
                 comp["ecart"] = comp["portefeuille_apres"] - comp["portefeuille_avant"]
-                st.dataframe(comp.style.format({c: (lambda v: pct(v, 1, True)) for c in ["portefeuille_avant", "portefeuille_apres", "ecart"]}).map(signe_couleur, subset=["ecart"]),
+                tableau(comp.style.format({c: (lambda v: pct(v, 1, True)) for c in ["portefeuille_avant", "portefeuille_apres", "ecart"]}).map(signe_couleur, subset=["ecart"]),
                              hide_index=True, column_config={"scenario": "Crise rejouée", "portefeuille_avant": "Avant", "portefeuille_apres": "Après", "ecart": "Écart"})
 
 # ================================================================== STRESS
-with onglets[5]:
+if page == "Stress tests":
     st.subheader("Si une crise passée se répétait")
     st.caption("Les poids d'aujourd'hui appliqués aux vrais cours de chaque crise. Une ligne qui n'existait pas encore reçoit le rendement moyen des autres.")
     st_df = stress(poids, adj_eur, BENCH_PRINCIPAL)
@@ -918,7 +1269,7 @@ with onglets[5]:
         fig.add_trace(go.Bar(y=st_df["scenario"], x=st_df["reference"], name="Euronext 100", orientation="h", marker_color=C_NEUTRE))
         fig.update_layout(barmode="group", height=460, xaxis_tickformat=".0%", margin=dict(t=10, l=0, r=40, b=0), legend=dict(orientation="h", y=1.06))
         st.plotly_chart(fig, key="stress")
-        st.dataframe(st_df.style.format({"portefeuille": lambda v: pct(v, 1, True), "reference": lambda v: pct(v, 1, True), "couverture": lambda v: pct(v, 0)}),
+        tableau(st_df.style.format({"portefeuille": lambda v: pct(v, 1, True), "reference": lambda v: pct(v, 1, True), "couverture": lambda v: pct(v, 0)}),
                      hide_index=True, column_config={"scenario": "Crise", "portefeuille": "Portefeuille", "reference": "Euronext 100", "couverture": "Capital avec historique"})
     st.subheader("Choc de marché instantané")
     choc = st.slider("Baisse de l'Euronext 100", -40, 0, -10, format="%d %%")
@@ -928,14 +1279,31 @@ with onglets[5]:
         st.caption("Estimation par le bêta : elle suppose que les corrélations restent normales, ce qui sous-estime la perte dans une vraie crise.")
 
 # ================================================================== CHANCE OU TALENT
-with onglets[6]:
+@st.cache_data(ttl=3600, show_spinner="Bootstrap en cours…")
+def bootstrap_cache(r_ptf, r_marche, n_boot=2000, bloc=5):
+    return A.bootstrap_alpha(r_ptf, r_marche, n_boot=n_boot, longueur_bloc=bloc)
+
+
+def lire_participants(fichier):
+    """Lit l'export de la carte performance-risque (CSV ou Excel). Colonnes reconnues : nom, performance, risque."""
+    try:
+        if hasattr(fichier, "name") and str(fichier.name).lower().endswith((".xls", ".xlsx")):
+            d = pd.read_excel(fichier)
+        else:
+            d = pd.read_csv(fichier, sep=None, engine="python")
+    except Exception as e:
+        return None, f"Fichier illisible : {e}"
+    return d, None
+
+
+if page == "Chance ou talent":
     st.subheader("Chance ou talent ?")
-    st.caption("On tire 10 000 portefeuilles au hasard qui suivent tes règles : même nombre de lignes, poids de 4,14 % "
-               "(2,5 % si la vol EWMA dépasse 40 %), au plus 20 % par secteur et 30 % par place, même part investie. "
-               "On les compare à tes lignes détenues au début de la période, conservées jusqu'à la fin.")
+    st.caption("La page suit la démarche de ton TFE : d'abord ce que le hasard seul peut produire (Monte Carlo), "
+               "puis un test sur tes vrais rendements sans supposer de loi normale (bootstrap), enfin la correction "
+               "des tests multiples à l'échelle de tous les participants (taux de fausses découvertes).")
     achats = tx.loc[tx["type"] == "achat", "date"].dropna()
     aujourdhui_d = dt.datetime.now(TZ).date()
-    defaut = achats.value_counts().idxmax().date() if len(achats) else aujourdhui_d  # le jour où tu as passé le plus d'ordres
+    defaut = achats.value_counts().idxmax().date() if len(achats) else aujourdhui_d
     c1, c2, c3 = st.columns([1, 1, 2])
     d_debut = c1.date_input("Début", value=min(defaut, aujourdhui_d), max_value=aujourdhui_d, format="DD/MM/YYYY")
     d_fin = c2.date_input("Fin", value=aujourdhui_d, max_value=aujourdhui_d, format="DD/MM/YYYY")
@@ -944,6 +1312,13 @@ with onglets[6]:
     if st.button("Lancer les 10 000 portefeuilles", type="primary"):
         st.session_state["simu_cle"] = (choix_u, d_debut, d_fin)
     cle = st.session_state.get("simu_cle")
+
+    # ------------------------------------------------------------- ÉTAPE 1
+    st.markdown("### Étape 1 · Ce que le hasard seul peut produire (Monte Carlo)")
+    st.caption("10 000 portefeuilles au hasard qui suivent tes règles : même nombre de lignes, poids de 4,14 % (2,5 % si la vol EWMA dépasse 40 %), "
+               "au plus 20 % par secteur et 30 % par place, même part investie. Ils sont comparés à tes lignes détenues au début de la période, conservées jusqu'à la fin "
+               "(Tarnavskyi, 2020 ; Burns, 2004).")
+    res = None
     if not cle:
         st.info("Choisis la période et l'univers, puis lance la simulation.")
     elif cle[2] <= cle[1]:
@@ -955,70 +1330,235 @@ with onglets[6]:
         res = simuler(tx, univ, cle[1], cle[2])
         if "erreur" in res:
             st.error(res["erreur"])
-        else:
-            ra, va, rm, vm = res["r_alea"], res["v_alea"], res["r_moi"], res["v_moi"]
-            bande = 0.01
+            res = None
+    if res:
+        ra, va, rm, vm = res["r_alea"], res["v_alea"], res["r_moi"], res["v_moi"]
+        bande = 0.01
+        proches = np.abs(va - vm) <= bande
+        if proches.sum() < 300:
+            bande = 0.02
             proches = np.abs(va - vm) <= bande
-            if proches.sum() < 300:
-                bande = 0.02
-                proches = np.abs(va - vm) <= bande
-            pct_tous = (ra < rm).mean()
-            pct_risque = (ra[proches] < rm).mean() if proches.any() else np.nan
-            p_val = (ra[proches] >= rm).mean() if proches.any() else np.nan
-            st.caption(f"Du {res['debut']:%d/%m/%Y} au {res['fin']:%d/%m/%Y} · {cle[0].lower()} ({res['univers_n']} titres) · "
-                       f"{res['n_lignes']} lignes · {pct(res['investi'], 0)} investi")
-            m = st.columns(4)
-            m[0].metric("Ton rendement", pct(rm, 2, True), f"Euronext 100 {pct(res['bench'], 2, True)}", delta_color="off")
-            m[1].metric("Mieux que", pct(pct_tous, 0), "de tous les portefeuilles aléatoires", delta_color="off")
-            m[2].metric("À risque égal, mieux que", pct(pct_risque, 0), f"{int(proches.sum())} portefeuilles à ± {pct(bande, 0)} de vol", delta_color="off")
-            m[3].metric("p-valeur", f"{p_val:.2f}".replace(".", ","), "le hasard fait aussi bien dans cette part des cas", delta_color="off")
-            if p_val < 0.05:
-                st.success("Sur cette période, le hasard explique difficilement ton résultat. Une seule période ne prouve pas un talent : refais le test chaque mois.")
-            elif p_val > 0.5:
-                st.warning("Sur cette période, des portefeuilles tirés au hasard avec tes règles font aussi bien ou mieux dans la majorité des cas.")
-            else:
-                st.info("Résultat compatible avec le hasard : ni preuve de talent, ni preuve du contraire. C'est normal sur une période courte.")
-
+        pct_tous = (ra < rm).mean()
+        pct_risque = (ra[proches] < rm).mean() if proches.any() else np.nan
+        p_val = (ra[proches] >= rm).mean() if proches.any() else np.nan
+        st.caption(f"Du {res['debut']:%d/%m/%Y} au {res['fin']:%d/%m/%Y} · {cle[0].lower()} ({res['univers_n']} titres) · "
+                   f"{res['n_lignes']} lignes · {pct(res['investi'], 0)} investi")
+        m = st.columns(4)
+        m[0].metric("Ton rendement", pct(rm, 2, True), f"Euronext 100 {pct(res['bench'], 2, True)}", delta_color="off")
+        m[1].metric("Mieux que", pct(pct_tous, 0), "de tous les portefeuilles aléatoires", delta_color="off")
+        m[2].metric("À risque égal, mieux que", pct(pct_risque, 0), f"{int(proches.sum())} portefeuilles à ± {pct(bande, 0)} de vol", delta_color="off")
+        m[3].metric("p-valeur", f"{p_val:.2f}".replace(".", ","), "le hasard fait aussi bien dans cette part des cas", delta_color="off")
+        if p_val < 0.05:
+            st.success("Sur cette période, le hasard explique difficilement ton résultat. Une seule période ne prouve pas un talent : refais le test chaque mois.")
+        elif p_val > 0.5:
+            st.warning("Sur cette période, des portefeuilles tirés au hasard avec tes règles font aussi bien ou mieux dans la majorité des cas.")
+        else:
+            st.info("Résultat compatible avec le hasard : ni preuve de talent, ni preuve du contraire. C'est normal sur une période courte.")
+        g, d = st.columns(2)
+        with g:
             fig = go.Figure()
-            fig.add_trace(go.Histogram(x=ra, nbinsx=80, name="Tous", marker_color="#c7c7c7", opacity=0.8))
-            fig.add_trace(go.Histogram(x=ra[proches], nbinsx=80, name="À risque égal", marker_color="#4c78a8", opacity=0.8))
+            fig.add_trace(go.Histogram(x=ra, nbinsx=70, name="Tous", marker_color="#c7c7c7", opacity=0.8))
+            fig.add_trace(go.Histogram(x=ra[proches], nbinsx=70, name="À risque égal", marker_color="#4c78a8", opacity=0.8))
             fig.add_vline(x=rm, line_color=C_MAUVAIS, line_width=2, annotation_text="toi", annotation_position="top")
             if pd.notna(res["bench"]):
                 fig.add_vline(x=res["bench"], line_color=C_NEUTRE, line_dash="dot", annotation_text="Euronext 100", annotation_position="bottom right")
-            fig.update_layout(barmode="overlay", height=360, xaxis_tickformat="+.1%", margin=dict(t=30, l=0, r=0, b=0),
-                              legend=dict(orientation="h", y=1.12), yaxis_title="nombre de portefeuilles")
+            fig.update_layout(barmode="overlay", height=340, xaxis_tickformat="+.1%", margin=dict(t=30, l=0, r=0, b=0),
+                              legend=dict(orientation="h", y=1.12), yaxis_title="portefeuilles")
             st.plotly_chart(fig, key="alea_hist")
-
-            st.subheader("Rendement contre risque prévu")
-            st.caption("Chaque point gris est un portefeuille aléatoire ; le risque est la volatilité prévue au début de la période (un an de cours).")
+        with d:
             fig = go.Figure()
             fig.add_trace(go.Scattergl(x=va, y=ra, mode="markers", marker=dict(size=3, color="#9e9e9e", opacity=0.35), name="Aléatoires",
                                        hovertemplate="vol %{x:.1%} · rendement %{y:+.2%}<extra></extra>"))
             fig.add_trace(go.Scatter(x=[vm], y=[rm], mode="markers+text", marker=dict(size=16, color=C_MAUVAIS, symbol="star"),
                                      text=["toi"], textposition="top center", name="Ton portefeuille"))
-            fig.update_layout(height=420, xaxis_tickformat=".0%", yaxis_tickformat="+.1%", xaxis_title="volatilité prévue",
-                              yaxis_title="rendement sur la période", margin=dict(t=10, l=0, r=0, b=0), showlegend=False)
+            fig.update_layout(height=340, xaxis_tickformat=".0%", yaxis_tickformat="+.1%", xaxis_title="volatilité prévue",
+                              yaxis_title="rendement", margin=dict(t=30, l=0, r=0, b=0), showlegend=False)
             st.plotly_chart(fig, key="alea_nuage")
-            notes = []
-            if res["exclus_moi"]:
-                notes.append("Lignes sans assez d'historique, comptées comme du cash : " + ", ".join(res["exclus_moi"]) + ".")
-            if res["incomplets"]:
-                notes.append(f"{res['incomplets']} tirages n'ont pas pu atteindre {res['n_lignes']} lignes à cause des limites ; leurs poids ont été remis à l'échelle.")
-            notes.append("Ton portefeuille dépasse peut-être lui-même une limite (secteur à 20 %) : les tirages, eux, la respectent toujours.")
-            for nt in notes:
-                st.caption(nt)
+        if res.get("survie") is not None and not res["survie"].empty:
+            st.markdown("**Tableau de survie, mois par mois** (la méthode de Tarnavskyi appliquée à toi)")
+            st.caption("Chaque mois : la part des portefeuilles aléatoires qui battent l'indice, et ta place parmi eux. Battre l'indice un mois où 80 % des tirages le battent ne dit rien de toi.")
+            sv = res["survie"].copy()
+            sv["tu_bats_indice"] = sv["tu_bats_indice"].map({True: "Oui", False: "Non"})
+            tableau(sv.style.format({"indice": lambda v: pct(v, 2, True), "part_alea_bat_indice": lambda v: pct(v, 0),
+                                     "toi": lambda v: pct(v, 2, True), "ton_percentile": lambda v: pct(v, 0)}),
+                    hide_index=True, column_config={"periode": "Mois", "indice": "Euronext 100", "part_alea_bat_indice": "Tirages qui battent l'indice",
+                                                    "toi": "Toi", "tu_bats_indice": "Tu bats l'indice", "ton_percentile": "Ta place parmi les tirages"})
+        notes = []
+        if res["exclus_moi"]:
+            notes.append("Lignes sans assez d'historique, comptées comme du cash : " + ", ".join(res["exclus_moi"]) + ".")
+        if res["incomplets"]:
+            notes.append(f"{res['incomplets']} tirages n'ont pas pu atteindre {res['n_lignes']} lignes à cause des limites ; leurs poids ont été remis à l'échelle.")
+        notes.append("Les tirages respectent toujours la limite de 20 % par secteur, même si ton portefeuille la dépasse.")
+        for nt in notes:
+            st.caption(nt)
+
+    # ------------------------------------------------------------- ÉTAPE 2
+    st.markdown("### Étape 2 · Tester sur tes vrais rendements, sans supposer de loi normale")
+    choix_serie = st.radio("Rendements testés", ["Portefeuille réel depuis le départ", "Portefeuille actuel rejoué sur un an"], horizontal=True,
+                           help="Le portefeuille rejoué applique tes poids d'aujourd'hui aux cours de l'année passée : il montre le comportement de ta stratégie, "
+                                "mais il ne prouve aucun talent, puisque tu as choisi ces lignes en connaissant déjà leur passé.")
+    if choix_serie.startswith("Portefeuille réel"):
+        sp = serie_portefeuille()
+        premier_achat = tx.loc[tx["type"] == "achat", "date"].dropna()
+        premier_achat = premier_achat.value_counts().idxmax() if len(premier_achat) else None
+        r_test = sp["rend"].dropna() if sp else pd.Series(dtype=float)
+        if premier_achat is not None:
+            r_test = r_test[r_test.index > premier_achat]   # avant, le portefeuille était surtout en cash
+    else:
+        rr_ = adj_eur[[t for t in poids.index if t in adj_eur.columns]].pct_change(fill_method=None).iloc[-252:].fillna(0)
+        r_test = rr_ @ poids.reindex(rr_.columns).fillna(0)
+        st.warning("Biais de sélection : ces lignes ont été choisies en connaissant leur passé. Ce test décrit ta stratégie, il ne mesure pas ton talent.")
+    r_bench = adj_eur[BENCH_PRINCIPAL].pct_change(fill_method=None).reindex(r_test.index) if BENCH_PRINCIPAL in adj_eur else None
+    if len(r_test) < 20 or r_bench is None:
+        st.info(f"Il faut au moins 20 jours de bourse pour cette étape ({len(r_test)} pour l'instant). En attendant, essaie « Portefeuille actuel rejoué sur un an ».")
+    else:
+        st.markdown("**a) Tes rendements suivent-ils une loi normale ?** (Heyman et al., 2014 ; Van Heerden, 2015)")
+        nm = A.normalite(r_test)
+        c = st.columns(4)
+        c[0].metric("Asymétrie", f"{nm['asymetrie']:+.2f}".replace(".", ","), "0 pour une loi normale", delta_color="off")
+        c[1].metric("Kurtosis", f"{nm['kurtosis']:.2f}".replace(".", ","), "3 pour une loi normale", delta_color="off")
+        c[2].metric("Jarque-Bera, p", f"{nm['jb_p']:.3f}".replace(".", ","), "sous 0,05 : pas normale", delta_color="off")
+        c[3].metric("Shapiro-Wilk, p", f"{nm['sw_p']:.3f}".replace(".", ","), "sous 0,05 : pas normale", delta_color="off")
+        x = r_test.values
+        fig = go.Figure(go.Histogram(x=x, nbinsx=40, histnorm="probability density", name="Tes rendements quotidiens", marker_color="#4c78a8", opacity=0.75))
+        grille = np.linspace(x.min(), x.max(), 200)
+        fig.add_trace(go.Scatter(x=grille, y=A.stats.norm.pdf(grille, x.mean(), x.std(ddof=1)), name="Loi normale de même moyenne et écart-type",
+                                 line=dict(color=C_MAUVAIS, width=2)))
+        fig.update_layout(height=280, xaxis_tickformat="+.1%", margin=dict(t=10, l=0, r=0, b=0), legend=dict(orientation="h", y=1.15))
+        st.plotly_chart(fig, key="normalite")
+        if min(nm["jb_p"], nm["sw_p"]) < 0.05:
+            st.caption("La loi normale est rejetée : les tests classiques (t de Jensen, Sharpe) sont donc biaisés, d'où le bootstrap ci-dessous.")
+        else:
+            st.caption("La loi normale n'est pas rejetée sur cet échantillon, souvent parce qu'il est encore court. Le bootstrap reste plus sûr.")
+
+        st.markdown("**b) Ton alpha résiste-t-il à un monde sans talent ?** (bootstrap de Kosowski et al., 2006, par blocs stationnaires)")
+        bt = bootstrap_cache(r_test, r_bench)
+        if bt:
+            c = st.columns(4)
+            c[0].metric("Alpha annualisé", pct(bt["alpha"] * 252, 1, True))
+            c[1].metric("t de l'alpha", f"{bt['t_alpha']:+.2f}".replace(".", ","), f"bêta {bt['beta']:.2f}".replace(".", ","), delta_color="off")
+            c[2].metric("p-valeur classique (loi normale)", f"{bt['p_param']:.3f}".replace(".", ","))
+            c[3].metric("p-valeur bootstrap", f"{bt['p_boot']:.3f}".replace(".", ","), "celle qu'il faut retenir", delta_color="off")
+            fig = go.Figure(go.Histogram(x=bt["t_boot"], nbinsx=60, marker_color="#c7c7c7", name="Monde sans talent"))
+            fig.add_vline(x=bt["t_alpha"], line_color=C_MAUVAIS, line_width=2, annotation_text="toi", annotation_position="top")
+            fig.add_vline(x=2, line_color=C_NEUTRE, line_dash="dot", annotation_text="t = 2", annotation_position="bottom right")
+            fig.update_layout(height=260, margin=dict(t=30, l=0, r=0, b=0), xaxis_title="t de l'alpha dans 2 000 mondes sans talent", showlegend=False)
+            st.plotly_chart(fig, key="boot")
+            st.caption("On garde tes vrais résidus et le vrai marché, on force l'alpha à zéro, puis on rééchantillonne par blocs de quelques jours pour garder "
+                       "l'enchaînement des séances. Si ton t dépasse rarement ceux de ce monde, l'alpha est difficile à attribuer à la chance. "
+                       "Avec beaucoup d'essais de stratégies, exige un t au-delà de 3 (Harvey, Liu et Zhu, 2016).")
+
+        st.markdown("**c) Sharpe probabiliste** (Bailey et López de Prado, 2012)")
+        ps = A.sharpe_probabiliste(r_test)
+        if ps:
+            c = st.columns(3)
+            c[0].metric("Sharpe annualisé", f"{ps['sr_annuel']:.2f}".replace(".", ","))
+            c[1].metric("Probabilité que le vrai Sharpe soit positif", pct(ps["psr"], 0))
+            c[2].metric("Même calcul en supposant la loi normale", pct(ps["psr_normal"], 0), pct(ps["psr"] - ps["psr_normal"], 0, True), delta_color="off")
+            st.caption("L'écart entre les deux probabilités, c'est ce que coûte le fait d'ignorer l'asymétrie et les queues épaisses de tes rendements.")
+
+    st.markdown("**d) Portefeuilles jumeaux : battre des actions qui te ressemblent** (Daniel et al., 1997 ; Heyman et al., 2014)")
+    if res and res.get("jumeaux"):
+        jm = res["jumeaux"]
+        c = st.columns(3)
+        c[0].metric("Ton rendement", pct(jm["r_moi"], 2, True))
+        c[1].metric("Mieux que tes jumeaux dans", pct(jm["percentile"], 0), "des 10 000 tirages", delta_color="off")
+        c[2].metric("p-valeur", f"{jm['p']:.2f}".replace(".", ","))
+        fig = go.Figure(go.Histogram(x=jm["r_jumeaux"], nbinsx=70, marker_color="#c7c7c7"))
+        fig.add_vline(x=jm["r_moi"], line_color=C_MAUVAIS, line_width=2, annotation_text="toi", annotation_position="top")
+        fig.update_layout(height=240, xaxis_tickformat="+.1%", margin=dict(t=30, l=0, r=0, b=0), showlegend=False)
+        st.plotly_chart(fig, key="jumeaux")
+        st.caption("Chaque ligne est remplacée par une action tirée au hasard du même secteur, du même tiers de momentum et du même tiers de volatilité. "
+                   "Si tu bats tes jumeaux, la performance vient du choix des titres, pas d'une simple exposition au momentum, au secteur ou au risque.")
+        det = jm["details"].copy()
+        det["ticker"] = [pf["nom"].get(t, t) for t in det["ticker"]]
+        with st.expander("Critères utilisés pour chaque ligne"):
+            tableau(det, hide_index=True, column_config={"ticker": "Ligne", "jumeaux_possibles": "Jumeaux possibles", "critere": "Critères"})
+    else:
+        st.caption("Lance la simulation de l'étape 1 pour obtenir les jumeaux.")
+
+    # ------------------------------------------------------------- ÉTAPE 3
+    st.markdown("### Étape 3 · Combien de participants ont vraiment du talent ? (Barras, Scaillet et Wermers, 2010)")
+    st.caption("Sur 200 participants, une dizaine paraîtront talentueux par pur hasard. Le taux de fausses découvertes estime la part de chance dans "
+               "les « gagnants » à partir de la carte performance-risque d'APTimum (menu ≡ › télécharger en CSV ou Excel).")
+    src_part = None
+    chemin = os.path.join(ICI, "participants.csv")
+    up = st.file_uploader("Fichier de la carte performance-risque", type=["csv", "xls", "xlsx"])
+    if up is not None:
+        src_part, err = lire_participants(up)
+    elif os.path.exists(chemin):
+        src_part, err = lire_participants(chemin)
+    else:
+        err = None
+    if err:
+        st.error(err)
+    if src_part is not None and len(src_part.columns) >= 2:
+        cols = list(src_part.columns)
+        c = st.columns(5)
+        c_nom = c[0].selectbox("Colonne du nom", cols, index=0)
+        c_perf = c[1].selectbox("Colonne performance", cols, index=min(2, len(cols) - 1))
+        c_risk = c[2].selectbox("Colonne risque", cols, index=min(1, len(cols) - 1))
+        jours_p = c[3].number_input("Jours de bourse de la période", 1, 260, 20)
+        ref = c[4].number_input("Performance de l'indice sur la période (%)", -50.0, 50.0, 0.0, step=0.1)
+        dfp = pd.DataFrame({"nom": src_part[c_nom].astype(str), "performance": src_part[c_perf].map(num), "risque": src_part[c_risk].map(num)})
+        for col in ["performance", "risque"]:
+            if dfp[col].abs().max() > 1.5:
+                dfp[col] = dfp[col] / 100
+        fd = A.fdr_participants(dfp, jours_p, perf_ref=ref / 100)
+        if not fd:
+            st.warning("Il faut au moins 20 participants avec une performance et un risque.")
+        else:
+            c = st.columns(4)
+            c[0].metric("Participants", fd["N"])
+            c[1].metric("Sans talent (alpha nul)", pct(fd["pi0"], 0))
+            c[2].metric("Vraiment meilleurs que l'indice", pct(fd["pi_plus"], 1))
+            c[3].metric("Vraiment moins bons", pct(fd["pi_moins"], 1))
+            st.caption(f"{fd['sig_pos']} participants paraissent significativement meilleurs au seuil de 10 %, mais on en attend environ "
+                       f"{fd['faux_attendus']:.0f} par pur hasard : la part de chance parmi ces « gagnants » est estimée à {pct(fd['fdr_plus'], 0)}.")
+            fig = go.Figure(go.Histogram(x=fd["table"]["t"], nbinsx=40, histnorm="probability density", marker_color="#4c78a8", opacity=0.75, name="Participants"))
+            g_ = np.linspace(-4, 4, 200)
+            fig.add_trace(go.Scatter(x=g_, y=A.stats.norm.pdf(g_), name="Si personne n'avait de talent", line=dict(color=C_MAUVAIS, width=2)))
+            fig.update_layout(height=260, margin=dict(t=10, l=0, r=0, b=0), xaxis_title="t de chaque participant", legend=dict(orientation="h", y=1.15))
+            st.plotly_chart(fig, key="fdr")
+            st.caption("Limites : un seul instantané, un t approximé à partir du risque annualisé, et des participants qui ne sont pas indépendants "
+                       "(beaucoup détiennent les mêmes titres). C'est un ordre de grandeur, comme le rappelle ton TFE.")
+    else:
+        st.caption("Ajoute le fichier ici, ou dépose-le sur GitHub sous le nom participants.csv pour qu'il soit lu automatiquement.")
+
+    # ------------------------------------------------------------- SIGNES EX ANTE
+    st.markdown("### Les signes de talent mesurables à l'avance")
+    st.caption("Ce qui, dans la littérature, prédit la performance future d'un gérant, calculé sur ton portefeuille actuel avec un an de cours.")
+    r1 = adj_eur.pct_change(fill_method=None).iloc[-252:]
+    lignes_ok = [t for t in poids.index if t in r1.columns]
+    rp = (r1[lignes_ok].fillna(0) @ poids.reindex(lignes_ok).fillna(0))
+    reg = A.regression(rp, r1[BENCH_PRINCIPAL]) if BENCH_PRINCIPAL in r1 else None
+    enb = A.nombre_effectif_paris(poids, r1)
+    c = st.columns(4)
+    if reg:
+        c[0].metric("R² face au marché", pct(reg["r2"], 0), "plus bas = plus de sélection", delta_color="off")
+        te = (rp - r1[BENCH_PRINCIPAL]).std() * np.sqrt(252)
+        c[1].metric("Écart de suivi", pct(te, 1), "à quel point tu t'écartes de l'indice", delta_color="off")
+    if enb:
+        c[2].metric("Nombre effectif de paris", f"{enb['enb']:.1f}".replace(".", ","), f"pour {enb['n_lignes']} lignes", delta_color="off")
+        c[3].metric("Part du premier facteur", pct(enb["part_premier_facteur"], 0), "le « marché » commun à tes lignes", delta_color="off")
+    st.markdown(
+        "- **R² faible** : Amihud et Goyenko (2013) montrent que les fonds les moins expliqués par le marché et les facteurs surperforment ensuite.\n"
+        "- **Écart à l'indice** : Cremers et Petajisto (2009) trouvent que les fonds qui s'écartent le plus de leur indice font mieux ; c'est contesté par "
+        "Frazzini, Friedman et Pomorski (2016), qui l'attribuent aux petites capitalisations.\n"
+        "- **Nombre effectif de paris** : le carré du ratio de diversification (Choueifaty et Coignard, 2008). 25 lignes qui bougent ensemble ne font que quelques paris.\n"
+        "- **Meilleures idées** : Cohen, Polk et Silli (2010) montrent que les positions de plus forte conviction surperforment ; trop diluer détruit l'avantage.")
 
 # ================================================================== JOURNAL
-with onglets[7]:
+if page == "Journal":
     st.subheader("Journal des transactions")
     st.caption("Ajoute chaque ordre exécuté dans l'onglet « transactions » de ton Google Sheet : le site le prend en compte dans la minute.")
-    st.dataframe(tx.assign(date=tx["date"].dt.strftime("%d/%m/%Y")), hide_index=True,
+    tableau(tx.assign(date=tx["date"].dt.strftime("%d/%m/%Y")), hide_index=True,
                  column_config={"date": "Date", "ticker": "Ticker", "type": "Type", "quantite": "Quantité", "prix": "Prix", "frais": "Frais", "commentaire": "Commentaire"})
     st.subheader("Ventes réalisées")
     if ventes.empty:
         st.caption("Aucune vente pour l'instant.")
     else:
-        st.dataframe(ventes.assign(date=ventes["date"].dt.strftime("%d/%m/%Y")).style.format(
+        tableau(ventes.assign(date=ventes["date"].dt.strftime("%d/%m/%Y")).style.format(
             {"pru": lambda v: eur(v, 2), "prix": lambda v: eur(v, 2), "resultat": lambda v: eur(v), "resultat_pct": lambda v: pct(v, 1, True)}).map(signe_couleur, subset=["resultat", "resultat_pct"]),
             hide_index=True)
     st.subheader("Effet de disposition (Odean, 1998)")
@@ -1047,7 +1587,7 @@ with onglets[7]:
         c[2].metric("PGR − PLR", pct(pgr - plr, 0, True), "biais présent" if pgr - plr > 0.05 else "pas de biais net", delta_color="off")
 
 # ================================================================== DONNÉES
-with onglets[8]:
+if page == "Données":
     st.subheader("Contrôle de la qualité des données")
     rows = []
     aujourdhui = pd.Timestamp.now(tz=TZ).normalize().tz_localize(None)
@@ -1061,7 +1601,7 @@ with onglets[8]:
         etat = "Cours ancien" if retard > 3 else ("Saut suspect" if r30 > 0.20 else ("Historique court" if len(s) < 250 else "OK"))
         rows.append({"ticker": t, "dernier_jour": s.index[-1].strftime("%d/%m/%Y"), "jours": len(s), "saut_max_30j": r30, "etat": etat})
     q = pd.DataFrame(rows)
-    st.dataframe(q.style.format({"saut_max_30j": lambda v: pct(v, 1)}).map(lambda v: "" if v == "OK" else f"color:{C_ATTENTION};font-weight:600", subset=["etat"]),
+    tableau(q.style.format({"saut_max_30j": lambda v: pct(v, 1)}).map(lambda v: "" if v == "OK" else f"color:{C_ATTENTION};font-weight:600", subset=["etat"]),
                  hide_index=True, column_config={"ticker": "Ticker", "dernier_jour": "Dernier cours", "jours": "Jours d'historique", "saut_max_30j": "Plus fort mouvement sur 30 jours", "etat": "État"})
     st.caption("Un « saut suspect » peut être une vraie nouvelle (résultats) ou une erreur d'ajustement de Yahoo : compare avec NextWise.")
     st.caption("Devises converties en euros : " + (", ".join(f"{t} ({d})" for t, d in devises.items() if d != "EUR") or "aucune"))

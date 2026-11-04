@@ -5,8 +5,10 @@ Cours Yahoo Finance différés d'environ 15 minutes, convertis en euros. Les chi
 
 ## Fichiers
 - `app.py` : l'appli
+- `analyses.py` : les calculs (bootstrap, jumeaux, FDR, momentum, régime)
 - `transactions.csv` : le journal (une ligne par ordre exécuté)
 - `lignes.csv` : la fiche de chaque ligne (poche, secteur, place, thèse, menace, sortie)
+- `participants.csv` (facultatif) : l'export de la carte performance-risque d'APTimum, pour l'étape 3 de « Chance ou talent »
 - `univers.csv` : les titres utilisés pour tirer les portefeuilles aléatoires (onglet « Chance ou talent »)
 - `requirements.txt` : les bibliothèques
 
