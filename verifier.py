@@ -81,4 +81,34 @@ txt = "Titre\n\n,Mkt-RF,SMB,HML\n20240102,  -0.52,   0.10,  0.32\n20240103,   0.
 ff = A.lire_french(txt)
 test("lecture Fama-French : 2 jours, valeurs en décimal", len(ff) == 2 and abs(ff.iloc[0, 0] + 0.0052) < 1e-12)
 
+# Sharpe de Lo : identique au Sharpe simple sans autocorrélation, plus bas avec une autocorrélation positive
+x = pd.Series(rng.normal(0.0005, 0.01, 3000))
+s1 = A.sharpe_lo(x)
+test("Sharpe de Lo = Sharpe simple sans autocorrélation", abs(s1["sr_lo"] - s1["sr_simple"]) < 0.05, f"{s1['sr_lo']:.3f} / {s1['sr_simple']:.3f}")
+e = rng.normal(0, 0.01, 3000); ar = np.zeros(3000)
+for i in range(1, 3000):
+    ar[i] = 0.3 * ar[i - 1] + e[i]
+s2 = A.sharpe_lo(pd.Series(ar + 0.0005))
+test("Sharpe de Lo < Sharpe simple avec autocorrélation positive", s2["sr_lo"] < s2["sr_simple"] * 0.85, f"{s2['sr_lo']:.3f} / {s2['sr_simple']:.3f}")
+
+# Sharpe dégonflé : plus d'essais = probabilité plus faible
+test("Sharpe dégonflé : 50 essais < 1 essai", A.sharpe_degonfle(x.iloc[:250], 50)["dsr"] < A.sharpe_degonfle(x.iloc[:250], 1)["dsr"])
+
+# VaR de Cornish-Fisher : ≈ VaR historique sur des données normales
+test("VaR Cornish-Fisher ≈ historique (loi normale)", abs(A.var_cornish_fisher(x) + np.percentile(x, 5)) < 0.001)
+
+# R² ajusté ≤ R²
+rr = A.regression_multi(pd.Series(rng.normal(size=300)), pd.DataFrame(rng.normal(size=(300, 5))))
+test("R² ajusté inférieur au R² brut", rr["r2_adj"] < rr["r2"])
+
+# HHI : 25 lignes égales -> 0,04 et 25 lignes effectives
+test("HHI de 25 lignes égales = 0,04", np.allclose(A.hhi(pd.Series(np.full(25, 0.04))), (0.04, 25.0)))
+
+# ratios : un portefeuille identique à l'indice a un bêta de 1, un écart de suivi nul et des captures de 1
+idx2 = pd.bdate_range("2024-01-01", periods=300)
+b2 = pd.Series(rng.normal(0.0003, 0.01, 300), index=idx2)
+tr, _ = A.ratios(b2, b2, 0.0)
+v_ = tr.set_index("ratio")["portefeuille"]
+test("ratios : copie de l'indice -> bêta 1, écart de suivi 0, capture 1", abs(v_["Bêta"] - 1) < 1e-9 and v_["Écart de suivi"] < 1e-12 and abs(v_["Capture haussière"] - 1) < 1e-9)
+
 print("\nTOUS LES TESTS PASSENT" if ok else "\nAU MOINS UN TEST ÉCHOUE")

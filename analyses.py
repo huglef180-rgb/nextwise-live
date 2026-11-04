@@ -44,8 +44,9 @@ def regression(y, x):
     cov = s2 * np.linalg.inv(X.T @ X)
     t_a = coef[0] / np.sqrt(cov[0, 0]) if cov[0, 0] > 0 else np.nan
     r2 = 1 - (res @ res) / ((yv - yv.mean()) @ (yv - yv.mean())) if yv.var() > 0 else np.nan
+    r2_adj = 1 - (1 - r2) * (n - 1) / (n - k) if pd.notna(r2) and n > k else np.nan   # k = 2 paramètres (constante + bêta)
     return {"alpha": coef[0], "beta": coef[1], "residus": pd.Series(res, index=z.index), "t_alpha": t_a,
-            "r2": r2, "n": n, "x": pd.Series(xv, index=z.index), "y": pd.Series(yv, index=z.index)}
+            "r2": r2, "r2_adj": r2_adj, "n": n, "x": pd.Series(xv, index=z.index), "y": pd.Series(yv, index=z.index)}
 
 
 # ======================================================================= chance ou talent
@@ -345,8 +346,9 @@ def regression_multi(y, X):
     cov = s2 * np.linalg.pinv(Xv.T @ Xv)
     t = coef / np.sqrt(np.clip(np.diag(cov), 1e-30, None))
     r2 = 1 - (res @ res) / ((yv - yv.mean()) @ (yv - yv.mean())) if yv.var() > 0 else np.nan
+    r2_adj = 1 - (1 - r2) * (n - 1) / (n - k) if pd.notna(r2) and n > k else np.nan   # k = constante + facteurs
     return {"alpha": coef[0], "t_alpha": t[0], "betas": pd.Series(coef[1:], index=X.columns),
-            "t": pd.Series(t[1:], index=X.columns), "r2": r2, "n": n, "residus": pd.Series(res, index=z.index),
+            "t": pd.Series(t[1:], index=X.columns), "r2": r2, "r2_adj": r2_adj, "n": n, "residus": pd.Series(res, index=z.index),
             "X": z[X.columns]}
 
 
@@ -544,3 +546,126 @@ def score_brier(df):
     cal = d.groupby("tranche", observed=True).agg(prevu=("probabilite", "mean"), realise=("resultat", "mean"), n=("resultat", "size"))
     return {"brier": bs, "n": len(d), "taux_reussite": base, "brier_reference": bs_ref,
             "skill": 1 - bs / bs_ref if bs_ref > 0 else np.nan, "calibration": cal}
+
+
+# ======================================================================= ratios de performance (logiciels pros)
+def sharpe_lo(r, rf_annuel=0.0, lags=10):
+    """Sharpe annualisé avec taux sans risque et correction d'autocorrélation de Lo (2002) :
+    SR_an = SR_jour × q / √(q + 2 Σ (q − k) ρ_k), q = 252 jours. Sans autocorrélation, on retrouve SR_jour × √252."""
+    x = pd.Series(r).dropna()
+    if len(x) < 20 or x.std(ddof=1) == 0:
+        return {"sr_simple": np.nan, "sr_lo": np.nan}
+    ex = x - rf_annuel / 252
+    sr = ex.mean() / ex.std(ddof=1)
+    q = 252
+    L = min(lags, len(x) // 4)
+    rho = [ex.autocorr(k) for k in range(1, L + 1)]
+    rho = [p for p in rho if pd.notna(p)]
+    denom = q + 2 * sum((q - k) * p for k, p in enumerate(rho, start=1))
+    sr_lo = sr * q / np.sqrt(denom) if denom > 0 else np.nan
+    return {"sr_simple": sr * np.sqrt(252), "sr_lo": sr_lo, "rho1": rho[0] if rho else np.nan}
+
+
+def sharpe_degonfle(r, n_essais, rf_annuel=0.0):
+    """Sharpe « dégonflé » (Bailey et López de Prado, 2014) : probabilité que le vrai Sharpe soit positif une fois
+    pris en compte le fait d'avoir essayé n_essais versions et gardé la meilleure. La variance des Sharpe des essais est
+    approchée par celle de l'estimateur, (1 + SR²/2) / (n − 1)."""
+    x = pd.Series(r).dropna() - rf_annuel / 252
+    n = len(x)
+    if n < 20 or x.std(ddof=1) == 0:
+        return None
+    sr = x.mean() / x.std(ddof=1)
+    g3, g4 = stats.skew(x), stats.kurtosis(x, fisher=False)
+    v_sr = (1 + sr ** 2 / 2) / (n - 1)
+    gamma = 0.5772156649
+    N = max(int(n_essais), 1)
+    sr0 = np.sqrt(v_sr) * ((1 - gamma) * stats.norm.ppf(1 - 1 / N) + gamma * stats.norm.ppf(1 - 1 / (N * np.e))) if N > 1 else 0.0
+    denom = 1 - g3 * sr + (g4 - 1) / 4 * sr ** 2
+    if denom <= 0:
+        return None
+    z = (sr - sr0) * np.sqrt(n - 1) / np.sqrt(denom)
+    return {"dsr": float(stats.norm.cdf(z)), "sr_seuil_annuel": sr0 * np.sqrt(252), "sr_annuel": sr * np.sqrt(252), "n_essais": N}
+
+
+def var_cornish_fisher(r, niveau=0.95):
+    """VaR de Cornish-Fisher (Favre et Galeano, 2002) : la VaR normale corrigée de l'asymétrie et de la kurtosis."""
+    x = pd.Series(r).dropna()
+    if len(x) < 20:
+        return np.nan
+    z = stats.norm.ppf(1 - niveau)
+    s, k = stats.skew(x), stats.kurtosis(x)          # kurtosis en excès
+    zcf = z + (z ** 2 - 1) * s / 6 + (z ** 3 - 3 * z) * k / 24 - (2 * z ** 3 - 5 * z) * s ** 2 / 36
+    return float(-(x.mean() + zcf * x.std(ddof=1)))
+
+
+def ratios(r, rb, rf_annuel=0.0):
+    """Tableau de ratios façon Morningstar / Bloomberg pour une série de rendements quotidiens r face à l'indice rb."""
+    z = pd.concat([pd.Series(r, name="p"), pd.Series(rb, name="b")], axis=1).dropna()
+    if len(z) < 20:
+        return None
+    p, b = z["p"], z["b"]
+    rf = rf_annuel / 252
+    n = len(z)
+    an = lambda x: (1 + x).prod() ** (252 / n) - 1
+    vol = lambda x: x.std(ddof=1) * np.sqrt(252)
+    def dd(x):
+        v = (1 + x).cumprod()
+        return v / v.cummax() - 1
+    def sortino(x):
+        neg = np.minimum(x - rf, 0)
+        dside = np.sqrt((neg ** 2).mean()) * np.sqrt(252)
+        return (an(x) - rf_annuel) / dside if dside > 0 else np.nan
+    def omega(x, seuil=0.0):
+        g, l = (x - seuil).clip(lower=0).sum(), (seuil - x).clip(lower=0).sum()
+        return g / l if l > 0 else np.nan
+    def ulcer(x):
+        return float(np.sqrt((dd(x) ** 2).mean()))
+    reg = regression(p - rf, b - rf)
+    beta = reg["beta"] if reg else np.nan
+    alpha_j = reg["alpha"] * 252 if reg else np.nan
+    bas = b < 0
+    beta_bas = np.cov(p[bas], b[bas])[0, 1] / b[bas].var() if bas.sum() > 10 and b[bas].var() > 0 else np.nan
+    te = (p - b).std(ddof=1) * np.sqrt(252)
+    ir = (an(p) - an(b)) / te if te > 0 else np.nan
+    sh_p, sh_b = sharpe_lo(p, rf_annuel), sharpe_lo(b, rf_annuel)
+    m2 = rf_annuel + sh_p["sr_simple"] * vol(b) if pd.notna(sh_p["sr_simple"]) else np.nan
+    haut, bas_ = b > 0, b < 0
+    cap_h = p[haut].mean() / b[haut].mean() if haut.sum() and b[haut].mean() != 0 else np.nan
+    cap_b = p[bas_].mean() / b[bas_].mean() if bas_.sum() and b[bas_].mean() != 0 else np.nan
+    lignes = [
+        ("Rendement annualisé", an(p), an(b), "Rendement composé ramené à un an."),
+        ("Volatilité annualisée", vol(p), vol(b), "Écart-type des rendements quotidiens × √252."),
+        ("Ratio de Sharpe (Lo)", sh_p["sr_lo"], sh_b["sr_lo"], "Excès sur le taux sans risque ÷ volatilité, annualisé avec la correction d'autocorrélation de Lo (2002)."),
+        ("Ratio de Sortino", sortino(p), sortino(b), "Comme le Sharpe, mais seule la volatilité des baisses compte (Sortino et Price, 1994)."),
+        ("Plus forte baisse", dd(p).min(), dd(b).min(), "Pire chute depuis un sommet sur la période."),
+        ("Ratio de Calmar", (an(p) / -dd(p).min()) if dd(p).min() < 0 else np.nan, (an(b) / -dd(b).min()) if dd(b).min() < 0 else np.nan, "Rendement annualisé ÷ plus forte baisse."),
+        ("Indice d'ulcère", ulcer(p), ulcer(b), "Profondeur et durée des baisses (Martin, 1987) : plus bas = moins pénible à détenir."),
+        ("Ratio Omega", omega(p), omega(b), "Somme des gains ÷ somme des pertes quotidiennes (Keating et Shadwick, 2002) ; au-dessus de 1 = plus de gains que de pertes."),
+        ("VaR 95 % historique (1 jour)", -np.percentile(p, 5), -np.percentile(b, 5), "Perte dépassée un jour sur vingt, lue dans l'historique."),
+        ("VaR 95 % Cornish-Fisher (1 jour)", var_cornish_fisher(p), var_cornish_fisher(b), "VaR normale corrigée de l'asymétrie et des queues épaisses (Favre et Galeano, 2002)."),
+        ("Expected Shortfall 95 % (1 jour)", -p[p <= np.percentile(p, 5)].mean(), -b[b <= np.percentile(b, 5)].mean(), "Perte moyenne les jours au-delà de la VaR."),
+        ("Bêta", beta, 1.0, "Sensibilité aux mouvements de l'indice."),
+        ("Bêta à la baisse", beta_bas, 1.0, "Bêta calculé seulement les jours de baisse de l'indice (Ang, Chen et Xing, 2006)."),
+        ("Alpha de Jensen (annualisé)", alpha_j, 0.0, "Rendement non expliqué par le bêta (Jensen, 1968)."),
+        ("Ratio de Treynor", (an(p) - rf_annuel) / beta if beta and pd.notna(beta) and beta != 0 else np.nan, an(b) - rf_annuel, "Excès de rendement ÷ bêta : la rémunération du risque de marché."),
+        ("Écart de suivi", te, 0.0, "Volatilité de l'écart quotidien avec l'indice."),
+        ("Ratio d'information", ir, np.nan, "Surperformance annualisée ÷ écart de suivi : la régularité de la surperformance (Grinold et Kahn, 2000)."),
+        ("M² (Modigliani)", m2, an(b), "Ton rendement s'il avait le risque de l'indice : la mesure la plus lisible (Modigliani et Modigliani, 1997)."),
+        ("Capture haussière", cap_h, 1.0, "Part des hausses de l'indice que tu captes."),
+        ("Capture baissière", cap_b, 1.0, "Part des baisses de l'indice que tu subis : sous 1, tu amortis."),
+        ("Jours au-dessus de l'indice", float((p > b).mean()), np.nan, "Part des séances où tu fais mieux que l'indice."),
+        ("R² ajusté face à l'indice", reg["r2_adj"] if reg else np.nan, 1.0, "Part de tes variations expliquée par l'indice, corrigée du nombre de variables."),
+    ]
+    return pd.DataFrame(lignes, columns=["ratio", "portefeuille", "indice", "definition"]), n
+
+
+def hhi(poids):
+    """Indice de Herfindahl-Hirschman sur les poids des lignes ramenés à 100 % du capital investi, et son inverse
+    (nombre effectif de lignes)."""
+    w = pd.Series(poids).dropna()
+    w = w[w > 0]
+    if w.empty:
+        return np.nan, np.nan
+    w = w / w.sum()
+    h = float((w ** 2).sum())
+    return h, 1 / h
