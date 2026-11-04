@@ -9,6 +9,7 @@ Données :
 """
 print("[nextwise] le script démarre (avant les imports)", flush=True)
 import datetime as dt
+import html
 import os
 import urllib.parse
 from zoneinfo import ZoneInfo
@@ -18,6 +19,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 import analyses as A
 
@@ -29,6 +31,36 @@ except ImportError:  # pragma: no cover
     yf = None
 
 st.set_page_config(page_title="NextWise · suivi en direct", page_icon="📈", layout="wide")
+
+# Réparation automatique : si le navigateur n'a pas réussi à charger un élément (graphique, bouton…), on re-télécharge
+# le fichier manquant puis on recharge la page, sur la même page de l'appli. Au plus 3 fois de suite.
+WATCHDOG = """
+<script>
+(function () {
+  var P = window.parent, D;
+  try { D = P.document; } catch (e) { return; }
+  var CLE = "nw_reparations";
+  function nb() { try { return parseInt(P.sessionStorage.getItem(CLE) || "0", 10); } catch (e) { return 9; } }
+  function scan() {
+    var t = D.body ? D.body.innerText : "";
+    var m = t.match(/Failed to fetch dynamically imported module:\\s*(\\S+?\\.js)/);
+    if (!m) return;
+    if (nb() >= 3) return;
+    try { P.sessionStorage.setItem(CLE, String(nb() + 1)); } catch (e) {}
+    clearInterval(boucle);
+    var url = m[1], essais = 0;
+    function essai() {
+      fetch(url, { cache: "reload" }).then(function (r) { if (!r.ok) throw 0; P.location.reload(); })
+        .catch(function () { essais++; if (essais < 6) setTimeout(essai, 700); else P.location.reload(); });
+    }
+    essai();
+  }
+  var boucle = setInterval(scan, 1200);
+  setTimeout(function () { try { P.sessionStorage.setItem(CLE, "0"); } catch (e) {} }, 45000);
+})();
+</script>
+"""
+components.html(WATCHDOG, height=0)
 
 
 def log(msg):
@@ -140,7 +172,7 @@ def charger_tables():
         if c not in tx.columns:
             tx[c] = None
     for c in ["ticker", "nom", "poche", "secteur", "place", "poids_cible", "these", "menace", "sortie", "evenement", "devise",
-              "type_valo", "per", "croissance", "peg", "lynch", "roe", "dette", "moat", "binaire"]:
+              "type_valo", "per", "croissance", "peg", "lynch", "roe", "dette", "moat", "binaire", "diagnostic", "verdict"]:
         if c not in li.columns:
             li[c] = None
     tx["ticker"] = tx["ticker"].fillna("").str.strip().str.upper()
@@ -239,6 +271,10 @@ def _faux_historique(tickers, jours=1900):
             niveau *= 11.5
         out[t] = p / p[-3] * niveau
     df = pd.DataFrame(out, index=idx)
+    if os.environ.get("NEXTWISE_DEGRADE") == "1":   # test : tickers manquants, historique court, marché fermé
+        df = df.drop(columns=[c for c in ["EQNR.OL", "BZ=F", "IEGA.AS", "EUNH.DE", "IBGS.AS", "EURUSD=X", "^STOXX", "ASM.AS", "OR.PA"] if c in df.columns])
+        if "KRZ.IR" in df.columns:
+            df.loc[df.index[:-150], "KRZ.IR"] = np.nan
     return df, df.copy()
 
 
@@ -269,6 +305,8 @@ def historique(tickers):
 @st.cache_data(ttl=60, show_spinner=False)
 def intraday(tickers):
     tickers = sorted(set(tickers))
+    if os.environ.get("NEXTWISE_DEGRADE") == "1":
+        return pd.DataFrame()
     if MOCK or yf is None:
         h, _ = _faux_historique(tickers)
         idx = pd.date_range(pd.Timestamp.now(tz=TZ).normalize() + pd.Timedelta(hours=9), periods=60, freq="5min")
@@ -415,14 +453,7 @@ def tableau(data, column_config=None, hide_index=None, height=None, **_):
         lab = (column_config or {}).get(c, c)
         noms.append(lab if isinstance(lab, str) else str(c))
     sty = sty.relabel_index(noms, axis="columns")
-    if hide_index:
-        sty = sty.hide(axis="index")
-    else:
-        nom_index = (column_config or {}).get(sty.data.index.name)
-        sty = sty.hide(axis="index", names=True)
-        if isinstance(nom_index, str) or sty.data.index.name:
-            sty = sty.hide(axis="index", names=False)
-            sty.data.index.name = nom_index if isinstance(nom_index, str) else sty.data.index.name
+    sty = sty.hide(axis="index")   # l'index n'est jamais affiché : une colonne qui compte doit être une vraie colonne
     st.html(TABLE_CSS + '<div class="nwt">' + sty.to_html() + "</div>")
 
 
@@ -433,6 +464,8 @@ def couleur_etat(v):
 
 def signe_couleur(v):
     if pd.isna(v):
+        return ""
+    if abs(v) < 5e-5:
         return ""
     return f"color:{C_BON}" if v > 0 else (f"color:{C_MAUVAIS}" if v < 0 else "")
 
@@ -538,6 +571,105 @@ def simuler(tx, univ, debut, fin, n=10_000, graine=42):
             "bench": b, "debut": debut, "fin": fin, "survie": survie, "jumeaux": jum}
 
 
+# ================================================================== DONNÉES YAHOO À LA DEMANDE
+FICHIER_CAL = "/tmp/nextwise_calendrier.json"
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Fondamentaux Yahoo (une à deux minutes la première fois)…")
+def fondamentaux_yahoo(tickers):
+    """ROE, dette nette / Ebitda, PER, croissance et PEG depuis Yahoo, à titre indicatif (à vérifier sur MarketScreener)."""
+    rows = {}
+    rng = np.random.default_rng(11)
+    for t in tickers:
+        if MOCK or yf is None:
+            rows[t] = {"roe": rng.uniform(0.03, 0.35), "dette": rng.uniform(-0.5, 4.5), "per": rng.uniform(7, 35),
+                       "croissance": rng.uniform(-0.2, 0.4), "peg": rng.uniform(0.5, 3.5), "capitalisation": rng.uniform(2e9, 2e11)}
+            continue
+        try:
+            i = yf.Ticker(t).get_info()
+        except Exception as e:
+            log(f"fondamentaux {t} : {type(e).__name__}")
+            rows[t] = {}
+            continue
+        dette, cash_, ebitda = i.get("totalDebt"), i.get("totalCash"), i.get("ebitda")
+        nd = (dette - (cash_ or 0)) / ebitda if dette is not None and ebitda and ebitda > 0 else np.nan
+        rows[t] = {"roe": i.get("returnOnEquity"), "dette": nd, "per": i.get("forwardPE") or i.get("trailingPE"),
+                   "croissance": i.get("earningsGrowth"), "peg": i.get("trailingPegRatio") or i.get("pegRatio"),
+                   "capitalisation": i.get("marketCap")}
+    return pd.DataFrame(rows).T.apply(pd.to_numeric, errors="coerce")
+
+
+def charger_calendrier(tickers):
+    """Prochaines dates de résultats (Yahoo), gardées un jour dans un fichier du serveur."""
+    import json
+    out = {}
+    for t in tickers:
+        d = None
+        if MOCK or yf is None:
+            d = (pd.Timestamp.now() + pd.Timedelta(days=int(np.random.default_rng(abs(hash(t)) % 1000).integers(1, 90)))).strftime("%Y-%m-%d")
+        else:
+            try:
+                cal = yf.Ticker(t).calendar
+                dates = cal.get("Earnings Date") if isinstance(cal, dict) else None
+                if dates:
+                    d = pd.Timestamp(dates[0]).strftime("%Y-%m-%d")
+            except Exception as e:
+                log(f"calendrier {t} : {type(e).__name__}")
+        out[t] = d
+    try:
+        with open(FICHIER_CAL, "w") as f:
+            json.dump({"maj": dt.datetime.now().isoformat(), "dates": out}, f)
+    except Exception:
+        pass
+    return out
+
+
+def lire_calendrier():
+    import json
+    try:
+        with open(FICHIER_CAL) as f:
+            d = json.load(f)
+        if (dt.datetime.now() - dt.datetime.fromisoformat(d["maj"])).total_seconds() < 24 * 3600:
+            return d["dates"], d["maj"]
+    except Exception:
+        pass
+    return None, None
+
+
+def impact_candidats(w, tick_c, R, mode, a_par_ticker, ligne_remplacee=None):
+    """Volatilité et ratio de diversification du portefeuille si chaque candidat entre, soit à son poids cible financé
+    par tout le portefeuille, soit à la place d'une ligne. w : poids actuels (Series), R : rendements quotidiens sur un an."""
+    T = list(dict.fromkeys([t for t in w.index if t in R.columns] + [c for c in tick_c if c in R.columns]))
+    cov = R[T].fillna(0).cov().values * 252
+    pos = {t: i for i, t in enumerate(T)}
+    wv = np.zeros(len(T))
+    for t, x in w.items():
+        if t in pos:
+            wv[pos[t]] = x
+    sig = np.sqrt(np.diag(cov))
+    base_var = float(wv @ cov @ wv)
+    out = {}
+    for c in tick_c:
+        if c not in pos:
+            continue
+        j = pos[c]
+        if mode == "ajout":
+            a = a_par_ticker.get(c, POIDS_BASE)
+            w2 = (1 - a) * wv
+            w2[j] += a
+        else:
+            w2 = wv.copy()
+            r = pos.get(ligne_remplacee)
+            if r is None:
+                continue
+            a = wv[r]
+            w2[r] = 0.0
+            w2[j] += a
+        v = float(w2 @ cov @ w2)
+        out[c] = {"vol_apres": np.sqrt(v), "dr_apres": float((w2 * sig).sum() / np.sqrt(v)) if v > 0 else np.nan}
+    return pd.DataFrame(out).T, np.sqrt(base_var), float((wv * sig).sum() / np.sqrt(base_var)) if base_var > 0 else np.nan
+
+
 # ================================================================== PAGE
 st.session_state["_derniere_maj"] = dt.datetime.now().timestamp()
 
@@ -545,7 +677,7 @@ st.session_state["_derniere_maj"] = dt.datetime.now().timestamp()
 @st.fragment(run_every=60)
 def actualisation_auto():
     """Relance toute la page chaque minute pour reprendre les cours (si l'option est cochée)."""
-    if st.session_state.get("auto", True) and st.session_state.get("page", "Direct") == "Direct" and dt.datetime.now().timestamp() - st.session_state.get("_derniere_maj", 0) > 55:
+    if st.session_state.get("auto", True) and st.session_state.get("page", "Tableau de bord") == "Tableau de bord" and dt.datetime.now().timestamp() - st.session_state.get("_derniere_maj", 0) > 55:
         st.rerun()
 
 
@@ -574,7 +706,7 @@ with st.sidebar:
     st.caption("Cours : Yahoo Finance, différés d'environ 15 minutes, convertis en euros.")
     if MOCK:
         st.warning("Mode test : cours simulés.")
-    st.checkbox("Actualiser chaque minute (page Direct)", value=True, key="auto")
+    st.checkbox("Actualiser chaque minute (tableau de bord)", value=True, key="auto")
     actualisation_auto()
     if st.button("Rafraîchir les cours maintenant"):
         intraday.clear()
@@ -605,6 +737,10 @@ def instantane_direct():
     pf = positions.copy()
     pf["cours"] = [dernier.get(t, np.nan) for t in pf.index]
     pf["veille"] = [veille.get(t, np.nan) for t in pf.index]
+    pf["cours_absent"] = pf["cours"].isna()
+    # sans cours Yahoo : valorisé au prix de revient pour que la valeur totale et les poids restent justes
+    pf.loc[pf["cours_absent"], "cours"] = pf.loc[pf["cours_absent"], "pru"]
+    pf.loc[pf["cours_absent"], "veille"] = pf.loc[pf["cours_absent"], "pru"]
     pf["var_jour"] = pf["cours"] / pf["veille"] - 1
     pf["valeur"] = pf["quantite"] * pf["cours"]
     pf["gain_jour"] = pf["quantite"] * (pf["cours"] - pf["veille"])
@@ -614,7 +750,7 @@ def instantane_direct():
     total = titres + cash
     pf["poids"] = pf["valeur"] / total
     for c in ["nom", "poche", "secteur", "place", "poids_cible", "these", "menace", "sortie", "evenement",
-              "type_valo", "per", "croissance", "peg", "lynch", "roe", "dette", "moat", "binaire"]:
+              "type_valo", "per", "croissance", "peg", "lynch", "roe", "dette", "moat", "binaire", "diagnostic", "verdict"]:
         pf[c] = [lignes[c].get(t) if t in lignes.index else None for t in pf.index]
     pf["nom"] = [n if isinstance(n, str) and n else t for t, n in zip(pf.index, pf["nom"])]
     return pf, total, titres, intra_eur, dernier, veille, heure
@@ -705,8 +841,8 @@ regles_lignes = verifier_regles(pf, risque["corr"] if risque else None)
 
 alertes = []
 for t, r in pf.iterrows():
-    if pd.isna(r["cours"]):
-        alertes.append(("bad", f"{r['nom']} : aucun cours trouvé chez Yahoo pour « {t} ». Vérifie le ticker."))
+    if r.get("cours_absent", False):
+        alertes.append(("bad", f"{r['nom']} : aucun cours trouvé chez Yahoo pour « {t} » ; la ligne est valorisée à son prix de revient. Vérifie le ticker dans l'onglet Données."))
         continue
     if r["var_jour"] < LIM["alerte_jour"]:
         alertes.append(("bad", f"{r['nom']} perd {pct(r['var_jour'], signe=True)} aujourd'hui : relis sa condition de sortie."))
@@ -716,6 +852,14 @@ for t, r in pf.iterrows():
         alertes.append(("warn", f"{r['nom']} : vol EWMA {pct(r['vol_ewma'], 0)}, poids {pct(r['poids'])} au-dessus des 2,5 % prévus."))
     if t not in lignes.index or not isinstance(lignes.loc[t, "these"], str) or not lignes.loc[t, "these"].strip():
         alertes.append(("warn", f"{r['nom']} : fiche à compléter (thèse, menace, condition de sortie) dans l'onglet « lignes »."))
+cal_dates, cal_maj = lire_calendrier()
+if cal_dates:
+    auj_ = pd.Timestamp.now(tz=TZ).normalize().tz_localize(None)
+    for t, d in cal_dates.items():
+        if d and t in pf.index:
+            jj = (pd.Timestamp(d) - auj_).days
+            if 0 <= jj <= 3:
+                alertes.append(("warn", f"{pf.loc[t, 'nom']} publie ses résultats {'aujourd’hui' if jj == 0 else f'dans {jj} jour' + ('s' if jj > 1 else '')} ({pd.Timestamp(d):%d/%m}) : relis sa condition de sortie avant."))
 for t, rg in regles_lignes.iterrows():
     if rg["ligne_risquee"] == "✗":
         alertes.append(("warn", f"{rg['nom']} : ligne risquée qui ne remplit pas la règle ({rg['detail_risquee']})."))
@@ -731,27 +875,124 @@ for e in erreurs_journal:
     alertes.append(("warn", "Journal : " + e))
 
 # ---------------------------------------------------------------- en-tête
-st.title("Portefeuille NextWise")
 perf = total / apports - 1 if apports else np.nan
 gain_jour = pf["gain_jour"].sum(skipna=True)
 var_jour_ptf = gain_jour / (total - gain_jour) if total else np.nan
 bench_jour = dernier.get(BENCH_PRINCIPAL, np.nan) / veille.get(BENCH_PRINCIPAL, np.nan) - 1 if veille.get(BENCH_PRINCIPAL) else np.nan
-h = max(heure.values()) if heure else None
-st.caption(
-    f"Mis à jour à {pd.Timestamp(h).strftime('%H:%M') if h is not None and getattr(pd.Timestamp(h), 'hour', 0) else 'la dernière clôture'}"
-    f" · {len(pf)} lignes · {len([a for a in alertes if a[0] == 'bad'])} alertes rouges"
-)
-k = st.columns(5)
-k[0].metric("Valeur totale", eur(total), f"{pct(var_jour_ptf, 2, True)} aujourd'hui")
-k[1].metric("Gain du jour", eur(gain_jour), f"Euronext 100 {pct(bench_jour, 2, True)}", delta_color="off")
-k[2].metric("Depuis le départ", pct(perf, 2, True), eur(total - apports))
-k[3].metric("Cash", eur(cash), f"{pct(cash / total)} du total", delta_color="off")
-if risque:
-    k[4].metric("Volatilité prévue", pct(risque["vol"]), f"bêta {risque['beta']:.2f}".replace(".", ","), delta_color="off")
+h_maj = max(heure.values()) if heure else None
+h_txt = pd.Timestamp(h_maj).strftime("%H:%M") if h_maj is not None and getattr(pd.Timestamp(h_maj), "hour", 0) else "dernière clôture"
 
-PAGES = ["Direct", "Lignes", "Performance", "Risque", "Momentum", "Régime", "Simulateur", "Stress tests", "Chance ou talent", "Règles", "Journal", "Données"]
-page = st.radio("Page", PAGES, horizontal=True, key="page", label_visibility="collapsed")
-st.divider()
+CSS_GLOBAL = """<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+html, body, p, li, label, h1, h2, h3, h4, td, th, .stMarkdown, .stCaption {font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;}
+[data-testid="stIconMaterial"], .material-symbols-rounded {font-family: 'Material Symbols Rounded' !important;}
+.block-container {padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1500px;}
+h1, h2, h3 {letter-spacing: -0.01em;}
+h2 {font-weight: 650 !important;}
+h3 {font-weight: 600 !important; margin-top: 0.6rem !important;}
+[data-testid="stMetricValue"] {font-variant-numeric: tabular-nums; font-weight: 600;}
+[data-testid="stMetricLabel"] p {font-size: 0.78rem; text-transform: uppercase; letter-spacing: .05em; opacity: .75;}
+.nw-top {display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:6px;}
+.nw-top .titre {font-size:1.35rem; font-weight:700; letter-spacing:-.01em;}
+.nw-top .etat {font-size:.8rem; opacity:.75;}
+.nw-chip {display:inline-block; padding:2px 9px; border-radius:999px; font-size:.75rem; font-weight:600; margin-left:6px;}
+.nw-chip.rouge {background:rgba(239,68,68,.15); color:#ef4444;}
+.nw-chip.orange {background:rgba(245,158,11,.15); color:#d97706;}
+.nw-chip.vert {background:rgba(34,197,94,.15); color:#16a34a;}
+.nw-chip.gris {background:rgba(127,127,127,.15);}
+.nw-band {display:grid; grid-template-columns:repeat(auto-fit, minmax(132px, 1fr)); gap:10px; margin:2px 0 16px;}
+.nw-k {background:rgba(127,127,127,.07); border:1px solid rgba(127,127,127,.18); border-radius:12px; padding:10px 14px;}
+.nw-k .t {font-size:.7rem; text-transform:uppercase; letter-spacing:.07em; opacity:.65;}
+.nw-k .v {font-size:1.4rem; font-weight:650; font-variant-numeric:tabular-nums; line-height:1.3; margin-top:2px; white-space:nowrap;}
+.nw-k .s {font-size:.76rem; opacity:.85; font-variant-numeric:tabular-nums; line-height:1.35;}
+.nw-pos {color:#16a34a;} .nw-neg {color:#ef4444;} .nw-neu {opacity:.75;}
+.nw-j {margin:0 0 10px;}
+.nw-j .l {display:flex; justify-content:space-between; font-size:.82rem; margin-bottom:3px; gap:8px;}
+.nw-j .l b {font-variant-numeric:tabular-nums;}
+.nw-j .bar {height:8px; border-radius:6px; background:rgba(127,127,127,.18); position:relative; overflow:hidden;}
+.nw-j .bar span {position:absolute; left:0; top:0; bottom:0; border-radius:6px;}
+.nw-j .ok span {background:#22c55e;} .nw-j .pr span {background:#f59e0b;} .nw-j .ko span {background:#ef4444;}
+.nw-k.solo {margin-bottom:10px;} .nw-k.solo .v {font-size:1.25rem;}
+.nw-intro {font-size:.9rem; opacity:.8; margin:-4px 0 12px; max-width: 1100px;}
+</style>"""
+
+
+def _cl(v):
+    return "nw-pos" if pd.notna(v) and v > 0 else ("nw-neg" if pd.notna(v) and v < 0 else "nw-neu")
+
+
+def bandeau():
+    """Le bandeau des chiffres clés, en HTML simple (il ne dépend d'aucun composant chargé à la demande)."""
+    n_rouge = len([a for a in alertes if a[0] == "bad"])
+    n_orange = len([a for a in alertes if a[0] == "warn"])
+    chips = (f'<span class="nw-chip rouge">{n_rouge} alerte{"s" if n_rouge > 1 else ""}</span>' if n_rouge else "") + \
+            (f'<span class="nw-chip orange">{n_orange} à surveiller</span>' if n_orange else "") + \
+            ('<span class="nw-chip vert">tout est en ordre</span>' if not (n_rouge or n_orange) else "") + \
+            ('<span class="nw-chip gris">mode test</span>' if MOCK else "")
+    vol = risque["vol"] if risque else np.nan
+    beta = risque["beta"] if risque else np.nan
+    dr = risque["dr"] if risque else np.nan
+    cartes = [
+        ("Valeur totale", eur(total), f'<span class="{_cl(var_jour_ptf)}">{pct(var_jour_ptf, 2, True)}</span> aujourd\'hui'),
+        ("Gain du jour", f'<span class="{_cl(gain_jour)}">{eur(gain_jour)}</span>', f'Euronext 100 <span class="{_cl(bench_jour)}">{pct(bench_jour, 2, True)}</span>'),
+        ("Depuis le départ", f'<span class="{_cl(perf)}">{pct(perf, 2, True)}</span>', f'<span class="{_cl(total - apports)}">{eur(total - apports)}</span>'),
+        ("Cash", eur(cash), f"{pct(cash / total)} du total"),
+        ("Volatilité prévue", pct(vol), f"bêta {beta:.2f}".replace(".", ",") if pd.notna(beta) else "—"),
+        ("Diversification", f"{dr:.2f}".replace(".", ",") if pd.notna(dr) else "—", f"{len(pf)} lignes"),
+    ]
+    html = CSS_GLOBAL + '<div class="nw-top"><div class="titre">Portefeuille NextWise</div>' + \
+           f'<div class="etat">Cours à {h_txt} · différés d\'environ 15 min {chips}</div></div><div class="nw-band">' + \
+           "".join(f'<div class="nw-k"><div class="t">{t}</div><div class="v">{v}</div><div class="s">{s_}</div></div>' for t, v, s_ in cartes) + "</div>"
+    st.html(html)
+
+
+PALETTE = ["#4F8BFF", "#22C55E", "#F59E0B", "#EF4444", "#A855F7", "#14B8A6", "#64748B", "#EC4899"]
+
+
+def graphe(fig, key=None, **kw):
+    """Tous les graphiques passent par ici : même police, mêmes couleurs, fond transparent, sans barre d'outils."""
+    fig.update_layout(font=dict(family="Inter, Segoe UI, system-ui, sans-serif", size=12), colorway=PALETTE,
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", hoverlabel=dict(font_size=12))
+    fig.update_xaxes(gridcolor="rgba(127,127,127,.15)", zerolinecolor="rgba(127,127,127,.35)")
+    fig.update_yaxes(gridcolor="rgba(127,127,127,.15)", zerolinecolor="rgba(127,127,127,.35)")
+    if any(getattr(t, "type", "") == "bar" and getattr(t, "text", None) is not None for t in fig.data):
+        fig.update_traces(cliponaxis=False, selector=dict(type="bar"))
+        m = fig.layout.margin
+        fig.update_layout(margin=dict(l=m.l if m.l is not None else 0, r=max(m.r or 0, 80), t=m.t if m.t is not None else 10, b=m.b if m.b is not None else 0))
+    st.plotly_chart(fig, key=key, config={"displayModeBar": False, "locale": "fr"}, **kw)
+
+
+def jauges(cons):
+    """Contraintes en jauges : la barre montre le niveau rapporté à la limite."""
+    html = ""
+    for _, c in cons.iterrows():
+        cl = {"Respectée": "ok", "Proche": "pr", "Dépassée": "ko"}.get(c["etat"], "ok")
+        larg = min(100, 100 * c["niveau"] / c["limite"]) if c["limite"] else 0
+        html += (f'<div class="nw-j"><div class="l"><span>{c["regle"]}</span><b>{pct(c["niveau"])} / {pct(c["limite"], 0)}</b></div>'
+                 f'<div class="bar {cl}"><span style="width:{larg:.0f}%"></span></div></div>')
+    st.html(html)
+
+
+def kpi(conteneur, titre, valeur, sous=None, delta_color="normal", **_):
+    """Chiffre clé en HTML (même style que le bandeau). Le sous-titre est coloré selon son signe
+    (vert si positif, rouge si négatif ; l'inverse avec delta_color="inverse" ; neutre avec "off")."""
+    v = html.escape(str(valeur))
+    cl = ""
+    if sous is not None and delta_color != "off":
+        t0 = str(sous).strip()[:1]
+        pos, neg = t0 == "+", t0 in ("-", "−")
+        if not any(ch in "123456789" for ch in str(sous).split(" ")[0]):
+            pos = neg = False      # une variation nulle (+0,00 %) reste neutre
+        if delta_color == "inverse":
+            pos, neg = neg, pos
+        cl = " nw-pos" if pos else (" nw-neg" if neg else "")
+    s_ = f'<div class="s{cl}">{html.escape(str(sous))}</div>' if sous is not None and str(sous) != "" else ""
+    conteneur.html(f'<div class="nw-k solo"><div class="t">{html.escape(str(titre))}</div><div class="v">{v}</div>{s_}</div>')
+
+
+def intro(texte):
+    st.html(f'<div class="nw-intro">{texte}</div>')
+
 
 def serie_portefeuille():
     """Valeur quotidienne du portefeuille réel et rendements pondérés par le temps (les apports ne comptent pas comme gain)."""
@@ -779,7 +1020,12 @@ def serie_portefeuille():
             cash_j[m] -= f if f else (p if pd.notna(p) else 0)
         elif typ == "dividende":
             cash_j[m] += ((q * p) if pd.notna(q) and pd.notna(p) else (p if pd.notna(p) else 0)) - f
-    px_j = close_eur.reindex(jours)[tickers_tous].ffill()
+    px_j = close_eur.reindex(index=jours, columns=tickers_tous).ffill()
+    # titre sans aucun cours chez Yahoo : on le valorise à son dernier prix de transaction plutôt que de le faire disparaître
+    for t in px_j.columns[px_j.isna().all()]:
+        dern = tx.loc[(tx["ticker"] == t) & tx["prix"].notna(), "prix"]
+        if len(dern):
+            px_j[t] = float(dern.iloc[-1])
     valeur_j = (qte * px_j).sum(axis=1, min_count=1).fillna(0) + cash_j
     if jours[-1] >= pd.Timestamp.now(tz=TZ).normalize().tz_localize(None):
         valeur_j.iloc[-1] = total
@@ -791,7 +1037,7 @@ def serie_portefeuille():
 
 
 # ================================================================== DIRECT
-if page == "Direct":
+def page_direct():
     g, d = st.columns([3, 2])
     with g:
         st.subheader("Carte du portefeuille")
@@ -799,14 +1045,15 @@ if page == "Direct":
         carte = pf.dropna(subset=["valeur"]).copy()
         carte["poche"] = carte["poche"].fillna("Sans poche")
         carte["etiquette"] = carte["nom"] + "<br>" + carte["var_jour"].map(lambda v: pct(v, 1, True))
-        fig = px.treemap(carte.reset_index(), path=["poche", "etiquette"], values="valeur", color="var_jour",
+        fig = px.treemap(carte.reset_index(), path=[px.Constant("Portefeuille"), "poche", "etiquette"], values="valeur", color="var_jour",
                          color_continuous_scale=["#b2182b", "#ef8a62", "#f7f7f7", "#67a9cf", "#1a9850"][::1],
                          range_color=(-0.03, 0.03), color_continuous_midpoint=0,
                          custom_data=["nom", "poids", "latent_pct"])
-        fig.update_traces(hovertemplate="<b>%{customdata[0]}</b><br>Poids %{customdata[1]:.1%}<br>Latent %{customdata[2]:+.1%}<extra></extra>",
+        fig.update_traces(root_color="rgba(0,0,0,0)", pathbar_visible=False, marker=dict(line=dict(width=1.5, color="rgba(255,255,255,.6)"), pad=dict(t=22, l=3, r=3, b=3)),
+                          hovertemplate="<b>%{customdata[0]}</b><br>Poids %{customdata[1]:.1%}<br>Latent %{customdata[2]:+.1%}<extra></extra>",
                           texttemplate="%{label}", textfont_size=13)
         fig.update_layout(margin=dict(t=10, l=0, r=0, b=0), height=430, coloraxis_showscale=False)
-        st.plotly_chart(fig, key="carte")
+        graphe(fig, key="carte", theme=None)
     with d:
         st.subheader("Alertes")
         if not alertes:
@@ -814,9 +1061,7 @@ if page == "Direct":
         for niveau, texte in sorted(alertes, key=lambda a: a[0] != "bad")[:12]:
             (st.error if niveau == "bad" else st.warning)(texte)
         st.subheader("Contraintes")
-        tableau(
-            cons.style.format({"niveau": lambda v: pct(v), "limite": lambda v: "≤ " + pct(v, 0)}).map(couleur_etat, subset=["etat"]),
-            hide_index=True, column_config={"regle": "Règle", "niveau": "Niveau", "limite": "Limite", "etat": "État"})
+        jauges(cons)
 
     st.subheader("Aujourd'hui")
     if not intra_eur.empty:
@@ -831,7 +1076,7 @@ if page == "Direct":
             fig.add_trace(go.Scatter(x=b.index, y=b, name="Euronext 100", line=dict(width=1.5, dash="dot", color=C_NEUTRE)))
         fig.add_hline(y=0, line_color="#bbbbbb", line_width=1)
         fig.update_layout(height=280, margin=dict(t=10, l=0, r=0, b=0), yaxis_tickformat="+.1%", legend=dict(orientation="h", y=1.1), hovermode="x unified")
-        st.plotly_chart(fig, key="jour")
+        graphe(fig, key="jour")
     else:
         st.caption("Marché fermé : pas de cours intrajournaliers. Les variations affichées sont celles de la dernière séance.")
 
@@ -842,10 +1087,10 @@ if page == "Direct":
                            text=[pct(v, 1, True) for v in tri["var_jour"]], textposition="outside",
                            hovertemplate="%{y} : %{x:+.2%}<extra></extra>"))
     fig.update_layout(height=max(300, 22 * len(tri)), margin=dict(t=10, l=0, r=40, b=0), xaxis_tickformat="+.0%")
-    st.plotly_chart(fig, key="varjour")
+    graphe(fig, key="varjour")
 
 # ================================================================== LIGNES
-if page == "Lignes":
+def page_lignes():
     st.subheader("Toutes les lignes")
     poches = ["Toutes"] + sorted(pf["poche"].dropna().unique().tolist())
     choix = st.selectbox("Poche", poches)
@@ -879,20 +1124,39 @@ if page == "Lignes":
             fig.add_hline(y=r["pru"], line_dash="dash", line_color=C_ATTENTION, annotation_text="prix de revient", annotation_position="top left")
             fig.add_hline(y=s.max(), line_dash="dot", line_color=C_NEUTRE, annotation_text="plus haut 52 semaines", annotation_position="bottom left")
             fig.update_layout(height=320, margin=dict(t=10, l=0, r=0, b=0), yaxis_title="€")
-            st.plotly_chart(fig, key="fiche")
+            graphe(fig, key="fiche")
     with b:
         st.markdown(f"### {r['nom']}")
         st.caption(f"{sel} · {r['poche'] or 'sans poche'} · {r['secteur'] or 'secteur ?'} · {r['place'] or 'place ?'}")
         m1, m2, m3 = st.columns(3)
-        m1.metric("Poids", pct(r["poids"]), f"cible {pct(r['poids_cible'])}" if pd.notna(r["poids_cible"]) else None, delta_color="off")
-        m2.metric("Latent", pct(r["latent_pct"], 1, True), eur(r["latent"]))
-        m3.metric("Momentum 12-1", pct(r.get("momentum"), 0, True))
-        for titre, champ in [("Thèse", "these"), ("Menace", "menace"), ("Je sors si", "sortie"), ("Prochain événement", "evenement")]:
+        kpi(m1, "Poids", pct(r["poids"]), f"cible {pct(r['poids_cible'])}" if pd.notna(r["poids_cible"]) else None)
+        kpi(m2, "Latent", pct(r["latent_pct"], 1, True), eur(r["latent"]))
+        kpi(m3, "Momentum 12-1", pct(r.get("momentum"), 0, True))
+        for titre, champ in [("Thèse", "these"), ("Menace", "menace"), ("Je sors si", "sortie"), ("Prochain événement", "evenement"), ("Moat", "moat"), ("Valorisation", "diagnostic"), ("Décision écrite", "verdict")]:
             v = r[champ]
             st.markdown(f"**{titre}** : {v if isinstance(v, str) and v.strip() else '*à compléter*'}")
 
+    st.subheader("Prochains résultats")
+    cal_d, cal_m = lire_calendrier()
+    if st.button("Charger les dates de résultats (Yahoo)"):
+        with st.spinner("Dates de résultats…"):
+            cal_d = charger_calendrier(list(pf.index))
+        cal_m = dt.datetime.now().isoformat()
+    if cal_d:
+        auj_ = pd.Timestamp.now(tz=TZ).normalize().tz_localize(None)
+        cdf = pd.DataFrame([{"nom": pf.loc[t, "nom"], "date": pd.Timestamp(d), "dans": (pd.Timestamp(d) - auj_).days}
+                            for t, d in cal_d.items() if d and t in pf.index]).sort_values("date")
+        cdf = cdf[cdf["dans"] >= -1]
+        tableau(cdf.style.format({"date": lambda v: f"{v:%d/%m/%Y}", "dans": lambda v: "aujourd'hui" if v == 0 else (f"dans {v} j" if v > 0 else "hier")})
+                .map(lambda v: f"color:{C_ATTENTION};font-weight:600" if isinstance(v, (int, np.integer)) and 0 <= v <= 7 else "", subset=["dans"]),
+                hide_index=True, column_config={"nom": "Ligne", "date": "Résultats", "dans": "Échéance"})
+        st.caption(f"Dates Yahoo, mises à jour le {pd.Timestamp(cal_m):%d/%m à %H:%M} et gardées 24 h. Une alerte s'affiche sur la page Direct à 3 jours. "
+                   "Yahoo se trompe parfois de quelques jours : vérifie sur le site de l'entreprise pour une ligne sensible.")
+    else:
+        st.caption("Clique sur le bouton pour récupérer les dates (environ 20 secondes).")
+
 # ================================================================== PERFORMANCE
-if page == "Performance":
+def page_performance():
     st.subheader("Valeur du portefeuille depuis le départ")
     sp = serie_portefeuille()
     if sp:
@@ -905,16 +1169,16 @@ if page == "Performance":
                 fig.add_trace(go.Scatter(x=bs.index, y=bs / bs.iloc[0] - 1, name=bn, line=dict(width=1.5, dash="dot")))
         fig.add_hline(y=0, line_color="#bbbbbb", line_width=1)
         fig.update_layout(height=380, margin=dict(t=10, l=0, r=0, b=0), yaxis_tickformat="+.1%", hovermode="x unified", legend=dict(orientation="h", y=1.08))
-        st.plotly_chart(fig, key="perf")
+        graphe(fig, key="perf")
         c1, c2, c3 = st.columns(3)
         dd = indice / indice.cummax() - 1
-        c1.metric("Plus forte baisse depuis un sommet", pct(dd.min(), 1))
+        kpi(c1, "Plus forte baisse depuis un sommet", pct(dd.min(), 1))
         jr = rend.dropna().iloc[1:]
-        c2.metric("Volatilité réalisée (annualisée)", pct(jr.std() * np.sqrt(252)) if len(jr) > 5 else "—")
-        c3.metric("Ratio de Sharpe réalisé", f"{jr.mean() / jr.std() * np.sqrt(252):.2f}".replace(".", ",") if len(jr) > 60 and jr.std() > 0 else "dès 3 mois d’historique")
+        kpi(c2, "Volatilité réalisée (annualisée)", pct(jr.std() * np.sqrt(252)) if len(jr) > 5 else "—")
+        kpi(c3, "Ratio de Sharpe réalisé", f"{jr.mean() / jr.std() * np.sqrt(252):.2f}".replace(".", ",") if len(jr) > 60 and jr.std() > 0 else "après 3 mois")
         fig = go.Figure(go.Scatter(x=dd.index, y=dd, fill="tozeroy", line=dict(color=C_MAUVAIS, width=1)))
-        fig.update_layout(height=180, margin=dict(t=10, l=0, r=0, b=0), yaxis_tickformat=".1%", title=dict(text="Baisse depuis le dernier sommet", font_size=13))
-        st.plotly_chart(fig, key="dd")
+        fig.update_layout(height=200, margin=dict(t=36, l=0, r=0, b=0), yaxis_tickformat=".1%", title=dict(text="Baisse depuis le dernier sommet", font_size=13))
+        graphe(fig, key="dd")
 
     st.subheader("Qui a fait la performance")
     st.caption("Plus-value latente par ligne, plus les ventes déjà réalisées.")
@@ -932,28 +1196,88 @@ if page == "Performance":
                            marker_color=[C_BON if v >= 0 else C_MAUVAIS for v in contrib["latent"]],
                            text=[eur(v) for v in contrib["latent"]], textposition="outside"))
     fig.update_layout(height=max(300, 22 * len(contrib)), margin=dict(t=10, l=0, r=60, b=0))
-    st.plotly_chart(fig, key="contrib")
+    graphe(fig, key="contrib")
 
     st.subheader("Par poche")
     gp = pf.groupby(pf["poche"].fillna("Sans poche")).agg(valeur=("valeur", "sum"), latent=("latent", "sum"), cout=("pru", lambda s: (s * pf.loc[s.index, "quantite"]).sum()))
     gp["poids"] = gp["valeur"] / total
     gp["rendement"] = gp["latent"] / gp["cout"]
-    tableau(gp[["poids", "valeur", "latent", "rendement"]].sort_values("poids", ascending=False).style.format(
+    tableau(gp[["poids", "valeur", "latent", "rendement"]].sort_values("poids", ascending=False).rename_axis("poche").reset_index().style.format(
         {"poids": lambda v: pct(v), "valeur": lambda v: eur(v), "latent": lambda v: eur(v), "rendement": lambda v: pct(v, 1, True)}).map(signe_couleur, subset=["latent", "rendement"]),
         column_config={"poche": "Poche", "poids": "Poids", "valeur": "Valeur", "latent": "Latent", "rendement": "Rendement"})
 
+
+    st.markdown("### Attribution par secteur (Brinson)")
+    intro("Ta performance face à un univers de référence à poids égaux (ta liste de départ), découpée en deux décisions : "
+          "<b>l'allocation</b> (avoir mis plus ou moins de poids dans les bons secteurs, cash compris) et <b>la sélection</b> "
+          "(avoir choisi de meilleurs titres que la moyenne du secteur). Méthode de Brinson et Fachler (1985).")
+    achats_b = tx.loc[tx["type"] == "achat", "date"].dropna()
+    if not len(achats_b):
+        st.info("Pas encore d'achat dans le journal.")
+        return
+    d0_def = achats_b.value_counts().idxmax().date()
+    c1, c2 = st.columns(2)
+    d0 = pd.Timestamp(c1.date_input("Début", value=d0_def, format="DD/MM/YYYY", key="br_d0"))
+    d1 = pd.Timestamp(c2.date_input("Fin", value=dt.datetime.now(TZ).date(), format="DD/MM/YYYY", key="br_d1"))
+    if d1 <= d0:
+        st.error("La date de fin doit être après la date de début.")
+        return
+    pos_b, cash_b, *_ = traiter_journal(tx[tx["date"] <= d0])
+    pu_b, _, uu_b = prix_univers(True)
+    tout_b = adj_eur.join(pu_b[[c for c in pu_b.columns if c not in adj_eur.columns]], how="outer")
+    p0, p1 = prix_au(tout_b, d0), prix_au(tout_b, d1)
+    c0 = prix_au(close_eur, d0)
+    val0 = pd.Series({t: pos_b.loc[t, "quantite"] * c0.get(t, np.nan) for t in pos_b.index}).dropna()
+    tot0 = val0.sum() + cash_b
+    if tot0 <= 0 or val0.empty:
+        st.info("Aucune ligne détenue à la date de début.")
+        return
+    w_lignes = val0 / tot0
+    r_lignes = (p1 / p0 - 1).reindex(w_lignes.index).fillna(0)
+    sect_l = pd.Series({t: (lignes["secteur"].get(t) if t in lignes.index else None) or "Autre" for t in w_lignes.index})
+    bench_t = [t for t in uu_b.index if t in p0.index and pd.notna(p0[t]) and pd.notna(p1[t])]
+    r_bench = (p1[bench_t] / p0[bench_t] - 1)
+    sect_b = uu_b.loc[bench_t, "secteur"]
+    tab = pd.DataFrame({"w_b": sect_b.value_counts(normalize=True), "r_b": r_bench.groupby(sect_b).mean()})
+    wp = w_lignes.groupby(sect_l).sum()
+    rp_s = (w_lignes * r_lignes).groupby(sect_l).sum() / wp
+    tab = tab.join(pd.DataFrame({"w_p": wp, "r_p": rp_s}), how="outer").fillna({"w_b": 0, "w_p": 0})
+    tab["r_b"] = tab["r_b"].fillna(tab["r_p"])
+    tab.loc["Cash", ["w_p", "r_p", "w_b", "r_b"]] = [cash_b / tot0, 0.0, 0.0, 0.0]
+    att, Rb = A.brinson(tab)
+    Rp = float((tab["w_p"] * tab["r_p"].fillna(0)).sum())
+    c = st.columns(4)
+    kpi(c[0], "Ton rendement (lignes du début)", pct(Rp, 2, True))
+    kpi(c[1], "Univers à poids égaux", pct(Rb, 2, True))
+    kpi(c[2], "Effet allocation", pct(att["allocation"].sum(), 2, True))
+    kpi(c[3], "Effet sélection (+ interaction)", pct(att["selection"].sum() + att["interaction"].sum(), 2, True))
+    att = att.sort_values("total")
+    fig = go.Figure()
+    fig.add_trace(go.Bar(y=att.index, x=att["allocation"], name="Allocation", orientation="h", marker_color=PALETTE[0]))
+    fig.add_trace(go.Bar(y=att.index, x=att["selection"] + att["interaction"], name="Sélection", orientation="h", marker_color=PALETTE[1]))
+    fig.update_layout(barmode="relative", height=max(280, 30 * len(att)), xaxis_tickformat="+.2%", margin=dict(t=10, l=0, r=0, b=0), legend=dict(orientation="h", y=1.08))
+    graphe(fig, key="brinson")
+    tableau(att[["w_p", "w_b", "r_p", "r_b", "allocation", "selection", "total"]].sort_values("total", ascending=False).rename_axis("secteur").reset_index().style.format(
+        {"w_p": lambda v: pct(v), "w_b": lambda v: pct(v), "r_p": lambda v: pct(v, 2, True), "r_b": lambda v: pct(v, 2, True),
+         "allocation": lambda v: pct(v, 2, True), "selection": lambda v: pct(v, 2, True), "total": lambda v: pct(v, 2, True)})
+        .map(signe_couleur, subset=["allocation", "selection", "total"]),
+        column_config={"secteur": "Secteur", "w_p": "Ton poids", "w_b": "Poids univers", "r_p": "Ton rendement", "r_b": "Rendement univers",
+                       "allocation": "Allocation", "selection": "Sélection", "total": "Total"})
+    st.caption("La ligne « Cash » mesure ce que t'a coûté (ou rapporté) le fait de ne pas être investi à 100 %. Les lignes achetées après la date de début ne comptent pas : "
+               "choisis une date de début après tes derniers achats.")
+
 # ================================================================== RISQUE
-if page == "Risque":
+def page_risque():
     if not risque:
         st.info("Pas assez d'historique pour calculer le risque.")
     else:
         st.caption(f"Sur un an de cours quotidiens en euros. Lignes couvertes : {pct(risque['couverture'], 0)} du capital investi.")
         c = st.columns(5)
-        c[0].metric("Volatilité prévue", pct(risque["vol"]))
-        c[1].metric("Ratio de diversification", f"{risque['dr']:.2f}".replace(".", ","))
-        c[2].metric("Bêta (Euronext 100)", f"{risque['beta']:.2f}".replace(".", ","))
-        c[3].metric("VaR 95 % sur un jour", eur(risque["var95"] * total), pct(-risque["var95"], 2), delta_color="off")
-        c[4].metric("Perte moyenne au-delà (ES)", eur(risque["es95"] * total), pct(-risque["es95"], 2), delta_color="off")
+        kpi(c[0], "Volatilité prévue", pct(risque["vol"]))
+        kpi(c[1], "Ratio de diversification", f"{risque['dr']:.2f}".replace(".", ","))
+        kpi(c[2], "Bêta (Euronext 100)", f"{risque['beta']:.2f}".replace(".", ","))
+        kpi(c[3], "VaR 95 % sur un jour", eur(risque["var95"] * total), pct(-risque["var95"], 2))
+        kpi(c[4], "Perte moyenne au-delà (ES)", eur(risque["es95"] * total), pct(-risque["es95"], 2))
 
         st.subheader("Capital contre risque")
         st.caption("À droite de la diagonale, la ligne pèse plus dans le risque que dans le capital.")
@@ -965,7 +1289,7 @@ if page == "Risque":
         fig.add_shape(type="line", x0=0, y0=0, x1=mx, y1=mx, line=dict(dash="dot", color=C_NEUTRE))
         fig.update_traces(textposition="top center", textfont_size=10, marker_size=10)
         fig.update_layout(height=460, xaxis_tickformat=".0%", yaxis_tickformat=".0%", xaxis_title="Part du capital", yaxis_title="Part du risque", margin=dict(t=10, l=0, r=0, b=0))
-        st.plotly_chart(fig, key="capr")
+        graphe(fig, key="capr")
 
         st.subheader("Secteurs : capital et risque")
         sec = pd.DataFrame({"capital": poids.groupby(pf["secteur"].fillna("Non renseigné")).sum(),
@@ -975,7 +1299,7 @@ if page == "Risque":
         fig.add_trace(go.Bar(y=sec.index, x=sec["risque"], name="Risque", orientation="h"))
         fig.add_vline(x=LIM["secteur"], line_dash="dash", line_color=C_MAUVAIS, annotation_text="limite")
         fig.update_layout(barmode="group", height=max(300, 45 * len(sec)), xaxis_tickformat=".0%", margin=dict(t=10, l=0, r=0, b=0), legend=dict(orientation="h", y=1.05))
-        st.plotly_chart(fig, key="sect")
+        graphe(fig, key="sect")
 
         st.subheader("Corrélations entre les lignes")
         st.caption("Rangées par ressemblance : les blocs foncés sont des lignes qui bougent ensemble.")
@@ -991,11 +1315,61 @@ if page == "Risque":
         noms_c = [pf["nom"].get(t, t) for t in corr.index]
         fig = px.imshow(corr.values, x=noms_c, y=noms_c, color_continuous_scale="RdBu_r", zmin=-1, zmax=1, aspect="auto")
         fig.update_layout(height=620, margin=dict(t=10, l=0, r=0, b=0))
-        st.plotly_chart(fig, key="corr")
+        graphe(fig, key="corr")
         m = corr.where(~np.eye(len(corr), dtype=bool)).stack()
         if len(m):
             (a1, a2), v = m.idxmax(), m.max()
             st.caption(f"Paire la plus corrélée : {pf['nom'].get(a1, a1)} et {pf['nom'].get(a2, a2)} ({v:.2f}).".replace(".", ",", 1))
+
+
+    st.markdown("### D'où vient ton risque : l'exposition aux facteurs")
+    intro("Une régression de ton portefeuille sur les grands facteurs connus. Un bêta élevé sur un facteur veut dire que ton portefeuille "
+          "se comporte en partie comme ce facteur : c'est un pari, voulu ou non. Ce qui n'est expliqué par aucun facteur est ta sélection propre.")
+    rp1 = portefeuille_rejoue(504)
+    ff = french_europe()
+    pu_f, bu_f, _ = prix_univers(True)
+    if ff is not None and not ff.empty and len(ff.index.intersection(rp1.index)) > 120:
+        fac = ff.copy()
+        fac.insert(0, "Marché (Euronext 100)", adj_eur[BENCH_PRINCIPAL].pct_change(fill_method=None))
+        source_f = f"Fama-French Europe (Kenneth French), données jusqu'au {ff.index.max():%d/%m/%Y}, et Euronext 100 pour le marché"
+    else:
+        fac = pd.DataFrame({"Marché (Euronext 100)": adj_eur[BENCH_PRINCIPAL].pct_change(fill_method=None),
+                            "Momentum (maison)": wml_cache(pu_f), "Basse volatilité (maison)": bv_cache(pu_f)})
+        source_f = ("facteurs construits sur ta liste de départ : marché (Euronext 100), momentum (gagnants − perdants) et basse volatilité "
+                    "(les moins volatils − les plus volatils, dans l'esprit de Frazzini et Pedersen, 2014)")
+    fac = fac.reindex(rp1.index)
+    rg = A.regression_multi(rp1, fac)
+    if rg is None:
+        st.info("Pas assez de données communes pour la régression.")
+    else:
+        st.caption(f"Portefeuille actuel rejoué sur deux ans · {source_f}.")
+        c = st.columns(3)
+        kpi(c[0], "Part expliquée par les facteurs (R²)", pct(rg["r2"], 0))
+        kpi(c[1], "Alpha annualisé", pct(rg["alpha"] * 252, 1, True), f"t = {rg['t_alpha']:.1f}".replace(".", ","))
+        kpi(c[2], "Jours utilisés", rg["n"])
+        g, d = st.columns(2)
+        with g:
+            bt = rg["betas"]
+            fig = go.Figure(go.Bar(x=bt.values, y=bt.index, orientation="h",
+                                   marker_color=[PALETTE[0] if abs(rg["t"][i]) >= 2 else "#9aa4b2" for i in bt.index],
+                                   text=[f"{v:+.2f} (t {rg['t'][i]:.1f})".replace(".", ",") for i, v in bt.items()], textposition="outside"))
+            fig.update_layout(height=300, margin=dict(t=30, l=0, r=60, b=0), title=dict(text="Bêtas (en bleu : significatifs, |t| ≥ 2)", font_size=13))
+            graphe(fig, key="fac_betas")
+        with d:
+            dv = A.decomposition_variance(rg)
+            fig = go.Figure(go.Bar(x=dv.values, y=dv.index, orientation="h", marker_color=PALETTE[2], text=[pct(v, 0) for v in dv.values], textposition="outside"))
+            fig.update_layout(height=300, xaxis_tickformat=".0%", margin=dict(t=30, l=0, r=40, b=0), title=dict(text="Part de la variance de ton portefeuille", font_size=13))
+            graphe(fig, key="fac_var")
+        st.caption("Lecture : un bêta momentum positif veut dire que tu détiens surtout des titres en tendance ; un bêta basse volatilité positif, que tu penches "
+                   "vers les titres calmes. Une part « propre aux titres » élevée correspond à un R² faible : c'est un signe de sélection active (Amihud et Goyenko, 2013).")
+        sens = A.sensibilites(adj_eur[[t for t in poids.index if t in adj_eur.columns]].pct_change(fill_method=None).reindex(fac.index), fac.dropna())
+        if not sens.empty:
+            sens.index = [pf["nom"].get(t, t) for t in sens.index]
+            fig = px.imshow(sens.T.values, x=list(sens.index), y=list(sens.columns), color_continuous_scale="RdBu_r", zmin=-1.5, zmax=1.5, aspect="auto",
+                            text_auto=".2f")
+            fig.update_layout(height=120 + 45 * sens.shape[1], margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Bêta de chaque ligne à chaque facteur", font_size=13),
+                              coloraxis_showscale=False)
+            graphe(fig, key="fac_lignes")
 
 # ================================================================== MOMENTUM
 @st.cache_data(ttl=3600, show_spinner="Cours de l'univers…")
@@ -1010,6 +1384,70 @@ def prix_univers(liste_seule=True):
     return ad[[c for c in ad.columns if c in u.index]], ad[BENCH_PRINCIPAL] if BENCH_PRINCIPAL in ad else None, u
 
 
+@st.cache_data(ttl=3600, show_spinner="Facteur basse volatilité…")
+def bv_cache(prix):
+    return A.facteur_basse_vol(prix)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Facteurs Fama-French Europe (Kenneth French)…")
+def french_europe():
+    """Facteurs européens quotidiens de la bibliothèque de Kenneth French (Dartmouth). Vide si le téléchargement échoue."""
+    if MOCK:
+        return pd.DataFrame()
+    import io, urllib.request, zipfile
+    base = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
+    out = []
+    for nom in ["Europe_5_Factors_Daily_CSV.zip", "Europe_Mom_Factor_Daily_CSV.zip"]:
+        try:
+            req = urllib.request.Request(base + nom, headers={"User-Agent": "Mozilla/5.0"})
+            data = urllib.request.urlopen(req, timeout=25).read()
+            z = zipfile.ZipFile(io.BytesIO(data))
+            txt = z.read(z.namelist()[0]).decode("latin-1")
+            out.append(A.lire_french(txt))
+        except Exception as e:
+            log(f"Fama-French {nom} : {type(e).__name__}: {e}")
+    if not out or any(o.empty for o in out):
+        return pd.DataFrame()
+    df = out[0].join(out[1], how="inner")
+    mom = [c for c in df.columns if c.upper().startswith(("WML", "MOM"))]
+    ren = {"SMB": "Taille (SMB)", "HML": "Value (HML)", "RMW": "Rentabilité (RMW)", "CMA": "Investissement (CMA)"}
+    if mom:
+        ren[mom[0]] = "Momentum (WML)"
+    return df.rename(columns=ren)[[v for v in ren.values() if v in df.rename(columns=ren).columns]]
+
+
+@st.cache_data(ttl=3600, show_spinner="Sensibilités aux facteurs de marché…")
+def series_macro():
+    """Pétrole (Brent), euro/dollar et obligations d'État européennes (ETF) pour les scénarios à curseurs."""
+    cand = {"Pétrole (Brent)": ["BZ=F"], "Euro / dollar": ["EURUSD=X"], "Obligations d'État € (prix)": ["IEGA.AS", "EUNH.DE", "IBGS.AS"]}
+    tout = sorted({t for l in cand.values() for t in l})
+    cl, _ = historique(tuple(tout))
+    out = {}
+    for nom, liste in cand.items():
+        for t in liste:
+            if t in cl.columns and cl[t].dropna().shape[0] > 300:
+                out[nom] = cl[t]
+                break
+    return pd.DataFrame(out)
+
+
+@st.cache_data(ttl=3600, show_spinner="Coefficients d'information…")
+def ic_cache(prix):
+    return A.ic_mensuel(prix, 36)
+
+
+@st.cache_data(ttl=3600, show_spinner="Historique des scores…")
+def scores_hist_cache(prix, bench):
+    return A.scores_historiques(prix, bench, 26)
+
+
+def portefeuille_rejoue(jours=252):
+    """Tes poids d'aujourd'hui appliqués aux rendements passés (le cash rapporte 0)."""
+    r = adj_eur.pct_change(fill_method=None).iloc[-jours:]
+    t = [x for x in poids.index if x in r.columns]
+    return r[t].fillna(0) @ poids.reindex(t).fillna(0)
+
+
 @st.cache_data(ttl=3600, show_spinner="Calcul des signaux de momentum…")
 def signaux_cache(prix, bench):
     return A.signaux_momentum(prix, bench)
@@ -1020,7 +1458,7 @@ def wml_cache(prix):
     return A.facteur_momentum(prix)
 
 
-if page == "Momentum":
+def page_momentum():
     st.subheader("Momentum et tendance")
     st.caption("Le momentum est l'une des anomalies les plus solides de la finance, mais à un horizon précis : les gagnants des 3 à 12 derniers mois "
                "continuent de gagner (Jegadeesh et Titman, 1993 ; Rouwenhorst, 1998 en Europe), alors que sur un mois, c'est l'inverse : les plus fortes "
@@ -1087,17 +1525,17 @@ if page == "Momentum":
                 fig = go.Figure(go.Scatter(x=cumul.index, y=cumul, line=dict(width=2), name="Gagnants − perdants"))
                 fig.add_hline(y=0, line_color="#bbbbbb", line_width=1)
                 fig.update_layout(height=280, yaxis_tickformat="+.0%", margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Rendement cumulé du facteur", font_size=13))
-                st.plotly_chart(fig, key="wml")
+                graphe(fig, key="wml")
             with d:
                 fig = go.Figure(go.Scatter(x=vol6.index, y=vol6, line=dict(width=2, color=C_ATTENTION)))
                 fig.update_layout(height=280, yaxis_tickformat=".0%", margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Volatilité du facteur sur 6 mois", font_size=13))
-                st.plotly_chart(fig, key="wmlvol")
+                graphe(fig, key="wmlvol")
             kr = A.risque_krach_momentum(adj_eur[BENCH_PRINCIPAL], wml)
             c = st.columns(4)
-            c[0].metric("Marché sur 2 ans", pct(kr["marche_2ans"], 0, True), "baissier : danger" if kr["marche_baissier"] else "pas baissier", delta_color="off")
-            c[1].metric("Volatilité du marché (6 mois)", pct(kr["vol_marche"], 0), f"seuil d'alerte {pct(kr['seuil_vol'], 0)}", delta_color="off")
-            c[2].metric("Volatilité du momentum (6 mois)", pct(kr["vol_wml"], 0))
-            c[3].metric("Exposition conseillée au momentum", "—" if pd.isna(kr["echelle_bsc"]) else f"{kr['echelle_bsc']:.1f}×".replace(".", ","),
+            kpi(c[0], "Marché sur 2 ans", pct(kr["marche_2ans"], 0, True), "baissier : danger" if kr["marche_baissier"] else "pas baissier")
+            kpi(c[1], "Vol. du marché", pct(kr["vol_marche"], 0), f"6 mois · alerte au-delà de {pct(kr['seuil_vol'], 0)}")
+            kpi(c[2], "Vol. du momentum", pct(kr["vol_wml"], 0), "6 derniers mois")
+            kpi(c[3], "Exposition conseillée", "—" if pd.isna(kr["echelle_bsc"]) else f"{kr['echelle_bsc']:.1f}×".replace(".", ","),
                         "Barroso et Santa-Clara (2015)", delta_color="off")
             if kr["alerte"]:
                 st.error("Risque de krach du momentum : marché en baisse sur 2 ans et volatilité forte. C'est dans ce contexte que le momentum s'effondre, "
@@ -1111,6 +1549,45 @@ if page == "Momentum":
         st.caption("Limites honnêtes : l'avantage des anomalies a baissé d'un tiers à la moitié après leur publication (McLean et Pontiff, 2016), "
                    "et sur 25 lignes et 5 mois, le bruit domine. Le momentum sert à choisir et à contrôler, pas à promettre une performance.")
 
+
+    st.markdown("### Le signal fonctionne-t-il sur ton univers ?")
+    intro("Chaque mois, on mesure la corrélation de rang entre un signal et le rendement du mois suivant sur les 66 titres de ta liste : c'est le "
+          "coefficient d'information (IC). Un IC moyen de 0,05 est déjà un bon signal (Grinold et Kahn, 2000). C'est le seul moyen de vérifier "
+          "un signal sur tes propres titres plutôt que de croire la littérature sur parole.")
+    pu_i, bu_i, _ = prix_univers(True)
+    ic = ic_cache(pu_i)
+    if ic.empty:
+        st.info("Pas assez d'historique.")
+    else:
+        moy, sd, n_ = ic.mean(), ic.std(), ic.count()
+        res_ic = pd.DataFrame({"ic_moyen": moy, "t": moy / (sd / np.sqrt(n_)), "positif": (ic > 0).mean(), "mois": n_})
+        g, d = st.columns([2, 3])
+        with g:
+            tableau(res_ic.rename_axis("signal").reset_index().style.format({"ic_moyen": lambda v: f"{v:+.3f}".replace(".", ","), "t": lambda v: f"{v:+.1f}".replace(".", ","),
+                                         "positif": lambda v: pct(v, 0), "mois": "{:.0f}"}).map(signe_couleur, subset=["ic_moyen"]),
+                    column_config={"signal": "Signal", "ic_moyen": "IC moyen", "t": "t", "positif": "Mois où IC > 0", "mois": "Mois"})
+            st.caption("Le signal « Dernier mois » est inversé : un IC positif confirme l'effet d'inversion à un mois. Un t au-delà de 2 rend le signal crédible.")
+        with d:
+            fig = go.Figure()
+            for i, c in enumerate(ic.columns):
+                fig.add_trace(go.Scatter(x=ic.index, y=ic[c].cumsum(), name=c, line=dict(width=2, color=PALETTE[i])))
+            fig.add_hline(y=0, line_color="#9aa4b2", line_width=1)
+            fig.update_layout(height=300, margin=dict(t=30, l=0, r=0, b=0), legend=dict(orientation="h", y=-0.15),
+                              title=dict(text="IC cumulé : une courbe qui monte = un signal qui marche", font_size=13))
+            graphe(fig, key="ic")
+
+    st.markdown("### Le score de tes lignes semaine après semaine")
+    intro("La carte montre l'évolution du score de momentum sur 26 semaines. Une ligne qui passe du vert au rouge perd sa tendance : "
+          "c'est souvent visible plusieurs semaines avant que le momentum 12-1 ne franchisse ta limite de sortie.")
+    lignes_h = [t for t in pf.index if t in adj_eur.columns]
+    shs = scores_hist_cache(adj_eur[lignes_h], adj_eur[BENCH_PRINCIPAL])
+    if not shs.empty:
+        shs = shs.loc[shs.iloc[:, -1].sort_values(ascending=False).index]
+        fig = px.imshow(shs.values, x=[f"{d:%d/%m}" for d in shs.columns], y=[pf["nom"].get(t, t) for t in shs.index],
+                        color_continuous_scale="RdYlGn", zmin=-1.5, zmax=1.5, aspect="auto")
+        fig.update_layout(height=40 + 24 * len(shs), margin=dict(t=10, l=0, r=0, b=0), coloraxis_colorbar=dict(title="score"))
+        graphe(fig, key="scores_hist")
+
 # ================================================================== RÉGIME
 @st.cache_data(ttl=3600, show_spinner="Calcul du régime de marché…")
 def regime_cache(prix, secteurs):
@@ -1120,7 +1597,7 @@ def regime_cache(prix, secteurs):
     return sect, A.turbulence(sect), A.ratio_absorption(sect)
 
 
-if page == "Régime":
+def page_regime():
     st.subheader("Régime de marché")
     st.caption("Deux mesures de stress utilisées par les gérants institutionnels, calculées sur les secteurs de ta liste de départ, "
                "et une mesure honnête de ta diversification.")
@@ -1140,12 +1617,12 @@ if page == "Régime":
         fig.add_hline(y=p75, line_dash="dot", line_color=C_ATTENTION, annotation_text="75e centile")
         fig.add_hline(y=p95, line_dash="dot", line_color=C_MAUVAIS, annotation_text="95e centile")
         fig.update_layout(height=300, margin=dict(t=10, l=0, r=0, b=0), legend=dict(orientation="h", y=1.12), yaxis_type="log")
-        st.plotly_chart(fig, key="turb")
+        graphe(fig, key="turb")
         c = st.columns(3)
-        c[0].metric("Turbulence actuelle (20 jours)", f"{actuel:.2f}".replace(".", ","), f"plus haut que {pct(rang, 0)} des jours", delta_color="off")
+        kpi(c[0], "Turbulence actuelle (20 jours)", f"{actuel:.2f}".replace(".", ","), f"plus haut que {pct(rang, 0)} des jours")
         etat = "Calme" if actuel < p75 else ("Agité" if actuel < p95 else "Turbulent")
-        c[1].metric("État", etat)
-        c[2].metric("Seuil turbulent (95e centile)", f"{p95:.2f}".replace(".", ","))
+        kpi(c[1], "État", etat)
+        kpi(c[2], "Seuil turbulent (95e centile)", f"{p95:.2f}".replace(".", ","))
         st.caption("En régime turbulent, les corrélations montent et la diversification fond : c'est le moment de vérifier tes stress tests et ton cash.")
     if len(absr) > 20:
         st.markdown("### Ratio d'absorption (Kritzman, Li, Page et Rigobon, 2011)")
@@ -1155,24 +1632,24 @@ if page == "Régime":
         delta = (ar15 - ar_an.mean()) / ar_an.std() if ar_an.std() > 0 else np.nan
         fig = go.Figure(go.Scatter(x=absr.index, y=absr, line=dict(width=2, color="#7b4ea3")))
         fig.update_layout(height=260, yaxis_tickformat=".0%", margin=dict(t=10, l=0, r=0, b=0))
-        st.plotly_chart(fig, key="absr")
+        graphe(fig, key="absr")
         c = st.columns(2)
-        c[0].metric("Ratio d'absorption", pct(float(absr.iloc[-1]), 0))
-        c[1].metric("Écart à sa moyenne de l'année", "—" if pd.isna(delta) else f"{delta:+.1f} écart-type".replace(".", ","),
+        kpi(c[0], "Ratio d'absorption", pct(float(absr.iloc[-1]), 0))
+        kpi(c[1], "Écart à sa moyenne de l'année", "—" if pd.isna(delta) else f"{delta:+.1f} écart-type".replace(".", ","),
                     "au-delà de +1 : fragilité" if pd.notna(delta) and delta > 1 else "normal", delta_color="off")
     st.markdown("### Combien de paris fais-tu vraiment ?")
     r1 = adj_eur.pct_change(fill_method=None).iloc[-252:]
     enb = A.nombre_effectif_paris(poids, r1)
     if enb:
         c = st.columns(3)
-        c[0].metric("Lignes", enb["n_lignes"])
-        c[1].metric("Paris réellement indépendants", f"{enb['enb']:.1f}".replace(".", ","))
-        c[2].metric("Ratio de diversification", f"{enb['dr']:.2f}".replace(".", ","))
+        kpi(c[0], "Lignes", enb["n_lignes"])
+        kpi(c[1], "Paris réellement indépendants", f"{enb['enb']:.1f}".replace(".", ","))
+        kpi(c[2], "Ratio de diversification", f"{enb['dr']:.2f}".replace(".", ","))
         st.caption("Le nombre de paris indépendants est le carré du ratio de diversification (Choueifaty et Coignard, 2008). Tes lignes bougeant en partie "
                    "ensemble, elles valent moins de paris que leur nombre. C'est la mesure à citer devant le jury plutôt que « 25 lignes ».")
 
 # ================================================================== RÈGLES
-if page == "Règles":
+def page_regles():
     st.subheader("Règles et conformité")
     st.markdown("### Chaque ligne passée au crible de tes règles")
     st.caption("✓ respectée · ✗ non respectée · – sans objet (par exemple la dette pour une banque). Les règles d'entrée servent à acheter ; "
@@ -1206,8 +1683,270 @@ if page == "Règles":
                 "et les titres « loterie » sous-performent (Bali, Cakici et Whitelaw, 2011). Exiger un avantage durable et une rentabilité élevée là où le risque "
                 "est le plus fort limite ce piège. Un narratif seul ne suffit pas : les actions « glamour » sous-performent (Lakonishok, Shleifer et Vishny, 1994).")
 
+# ================================================================== CANDIDATS
+def page_candidats():
+    st.subheader("Écran des candidats")
+    st.caption("Tout l'univers (environ 135 grandes valeurs européennes, hors tes lignes) passé au crible de tes règles d'entrée, avec ce que chaque titre "
+               "ferait à ton portefeuille. Un bon candidat respecte les règles et fait baisser le risque ou monter la diversification.")
+    pu, bu, uu = prix_univers(False)
+    if bu is None:
+        st.error("Indice de référence indisponible.")
+    else:
+        detenus = set(pf.index)
+        cand = [t for t in pu.columns if t not in detenus and pu[t].dropna().shape[0] > 260]
+        c1, c2, c3 = st.columns([2, 2, 1])
+        mode_txt = c1.radio("Test", ["Ajout à son poids cible", "Remplacement d'une ligne"], horizontal=True)
+        a_remplacer = None
+        if mode_txt.startswith("Remplacement"):
+            a_remplacer = c2.selectbox("Ligne remplacée", pf.sort_values("nom").index, format_func=lambda t: pf.loc[t, "nom"])
+        secteurs_dispo = ["Tous"] + sorted(uu["secteur"].dropna().unique().tolist())
+        sect_f = c3.selectbox("Secteur", secteurs_dispo)
+        f1, f2 = st.columns(2)
+        seulement_ok = f1.checkbox("Seulement les candidats sans aucun écart aux règles", value=False)
+        avec_fond = f2.checkbox("Ajouter les fondamentaux Yahoo (ROE, dette, PEG)", value=False,
+                                help="Une à deux minutes la première fois, puis gardés 24 h. Chiffres indicatifs : vérifie sur MarketScreener avant d'acheter.")
+
+        tous = pu.join(bu.rename(BENCH_PRINCIPAL)) if BENCH_PRINCIPAL not in pu.columns else pu
+        st_u = stats_lignes(tous, BENCH_PRINCIPAL)
+        sg_u = signaux_cache(pu[[c for c in pu.columns if pu[c].dropna().shape[0] > 260]], bu)
+        R = adj_eur.join(pu[[c for c in pu.columns if c not in adj_eur.columns]], how="outer").pct_change(fill_method=None).iloc[-252:]
+        a_cible = {c: (POIDS_REDUIT if pd.notna(st_u.loc[c, "vol_ewma"]) and st_u.loc[c, "vol_ewma"] > LIM["vol_reduite"] else POIDS_BASE)
+                   for c in cand if c in st_u.index}
+        imp, vol0, dr0 = impact_candidats(poids, cand, R, "ajout" if a_remplacer is None else "remplacement", a_cible, a_remplacer)
+        rp = (R[[t for t in poids.index if t in R.columns]].fillna(0) @ poids.reindex([t for t in poids.index if t in R.columns]).fillna(0))
+        # poids sectoriels et par place après l'opération
+        sec_now = pf.groupby(pf["secteur"].fillna("?"))["poids"].sum()
+        pl_now = pf.groupby(pf["place"].fillna("?"))["poids"].sum()
+        rows = []
+        for c in cand:
+            if c not in imp.index or c not in st_u.index:
+                continue
+            sct, plc = uu.loc[c, "secteur"], uu.loc[c, "place"]
+            a = a_cible.get(c, POIDS_BASE)
+            retire_s = retire_p = 0.0
+            if a_remplacer is not None:
+                a = float(pf.loc[a_remplacer, "poids"])
+                retire_s = a if pf.loc[a_remplacer, "secteur"] == sct else 0.0
+                retire_p = a if pf.loc[a_remplacer, "place"] == plc else 0.0
+            sec_apres = sec_now.get(sct, 0.0) * (1 if a_remplacer else (1 - a)) - retire_s + a
+            pl_apres = pl_now.get(plc, 0.0) * (1 if a_remplacer else (1 - a)) - retire_p + a
+            corr_l = R[[t for t in pf.index if t in R.columns]].corrwith(R[c]).drop(labels=[a_remplacer] if a_remplacer else [], errors="ignore")
+            rows.append({
+                "ticker": c, "nom": uu.loc[c, "nom"], "secteur": sct, "place": plc,
+                "score": sg_u["score"].get(c, np.nan), "momentum": st_u.loc[c, "momentum"], "rend_1m": sg_u["rend_1m"].get(c, np.nan),
+                "max_jour": st_u.loc[c, "max_jour"], "vol_ewma": st_u.loc[c, "vol_ewma"], "beta": st_u.loc[c, "beta"],
+                "corr_max": corr_l.max(), "corr_ptf": R[c].corr(rp),
+                "d_vol": imp.loc[c, "vol_apres"] - vol0, "d_dr": imp.loc[c, "dr_apres"] - dr0,
+                "secteur_apres": sec_apres, "place_apres": pl_apres, "poids_prevu": a,
+            })
+        cd = pd.DataFrame(rows).set_index("ticker")
+        if avec_fond and len(cd):
+            fo = fondamentaux_yahoo(tuple(cd.index))
+            cd = cd.join(fo[["roe", "dette", "per", "croissance", "peg"]], how="left")
+        else:
+            for k in ["roe", "dette", "per", "croissance", "peg"]:
+                cd[k] = np.nan
+
+        def ecarts(r):
+            e = []
+            if not (pd.notna(r["momentum"]) and r["momentum"] > 0):
+                e.append("momentum")
+            if pd.notna(r["max_jour"]) and r["max_jour"] > 0.08:
+                e.append("loterie")
+            if pd.notna(r["corr_max"]) and r["corr_max"] >= 0.7:
+                e.append("corrélation")
+            if r["secteur_apres"] > LIM["secteur"] + 1e-9:
+                e.append("secteur plein")
+            if r["place_apres"] > LIM["place"] + 1e-9:
+                e.append("place pleine")
+            if pd.notna(r["rend_1m"]) and r["rend_1m"] > 0.15:
+                e.append("inversion à 1 mois")
+            if pd.notna(r["roe"]) and r["roe"] < 0.10:
+                e.append("ROE")
+            if pd.notna(r["dette"]) and r["dette"] > 3 and r["secteur"] not in ("Finance", "Utilities"):
+                e.append("dette")
+            if pd.notna(r["peg"]) and r["peg"] > 2:
+                e.append("PEG")
+            if pd.notna(r["vol_ewma"]) and r["vol_ewma"] > LIM["vol_reduite"]:
+                e.append("ligne risquée : moat à vérifier")
+            return ", ".join(e)
+
+        if len(cd):
+            cd["ecarts"] = cd.apply(ecarts, axis=1)
+            cd["n_ecarts"] = cd["ecarts"].map(lambda x: 0 if not x else len(x.split(", ")))
+            if sect_f != "Tous":
+                cd = cd[cd["secteur"] == sect_f]
+            if seulement_ok:
+                cd = cd[cd["n_ecarts"] == 0]
+            cd = cd.sort_values(["n_ecarts", "d_dr", "score"], ascending=[True, False, False])
+            st.caption(f"Portefeuille actuel : volatilité {pct(vol0)}, ratio de diversification {dr0:.2f}. ".replace(".", ",", 1) +
+                       ("Chaque candidat entre à son poids cible, le reste du portefeuille est réduit d'autant." if a_remplacer is None
+                        else f"Chaque candidat prend la place de {pf.loc[a_remplacer, 'nom']} ({pct(pf.loc[a_remplacer, 'poids'])})."))
+            vue = cd.head(40).copy()
+            vue["ecarts"] = vue["ecarts"].replace("", "aucun")
+
+            def c_dvol(v):
+                return "" if pd.isna(v) else (f"color:{C_BON};font-weight:600" if v < -0.001 else (f"color:{C_MAUVAIS}" if v > 0.001 else ""))
+
+            def c_ddr(v):
+                return "" if pd.isna(v) else (f"color:{C_BON};font-weight:600" if v > 0.01 else (f"color:{C_MAUVAIS}" if v < -0.01 else ""))
+
+            def c_ec(v):
+                return f"color:{C_BON};font-weight:600" if v == "aucun" else f"color:{C_ATTENTION}"
+
+            n2 = lambda v: "—" if pd.isna(v) else f"{v:+.2f}".replace(".", ",")
+            tableau(vue[["nom", "secteur", "place", "ecarts", "d_dr", "d_vol", "corr_ptf", "corr_max", "score", "momentum", "rend_1m", "vol_ewma",
+                         "roe", "dette", "peg", "poids_prevu"]].style.format({
+                "d_dr": n2, "d_vol": lambda v: pct(v, 2, True), "corr_ptf": lambda v: "—" if pd.isna(v) else f"{v:.2f}".replace(".", ","),
+                "corr_max": lambda v: "—" if pd.isna(v) else f"{v:.2f}".replace(".", ","), "score": n2, "momentum": lambda v: pct(v, 0, True),
+                "rend_1m": lambda v: pct(v, 1, True), "vol_ewma": lambda v: pct(v, 0), "roe": lambda v: pct(v, 0), "dette": lambda v: "—" if pd.isna(v) else f"{v:.1f}".replace(".", ","),
+                "peg": lambda v: "—" if pd.isna(v) else f"{v:.2f}".replace(".", ","), "poids_prevu": lambda v: pct(v)})
+                .map(c_dvol, subset=["d_vol"]).map(c_ddr, subset=["d_dr"]).map(c_ec, subset=["ecarts"]).map(signe_couleur, subset=["momentum"]),
+                hide_index=True,
+                column_config={"nom": "Candidat", "secteur": "Secteur", "place": "Place", "ecarts": "Écarts aux règles", "d_dr": "Δ diversification",
+                               "d_vol": "Δ volatilité", "corr_ptf": "Corr. avec ton portefeuille", "corr_max": "Corr. max avec une ligne", "score": "Score momentum",
+                               "momentum": "Momentum 12-1", "rend_1m": "Dernier mois", "vol_ewma": "Vol EWMA", "roe": "ROE", "dette": "Dette nette / Ebitda",
+                               "peg": "PEG", "poids_prevu": "Poids prévu"})
+            st.caption(f"{len(cd)} candidats affichés sur {len(rows)}, les 40 premiers ci-dessus. Classement : d'abord le moins d'écarts aux règles, "
+                       "puis le plus fort gain de diversification, puis le meilleur momentum.")
+            with st.expander("Comment choisir"):
+                st.markdown(
+                    "1. **Aucun écart aux règles** d'abord : sinon tu prends une exception à justifier.\n"
+                    "2. **Δ diversification positif et Δ volatilité négatif** : le titre apporte quelque chose que tu n'as pas déjà. Une corrélation faible avec "
+                    "ton portefeuille va dans le même sens.\n"
+                    "3. **Score de momentum** : à diversification égale, prends la tendance la plus solide.\n"
+                    "4. Puis **vérifie à la main** : fondamentaux sur MarketScreener, prochains résultats, et écris la thèse, la menace et la condition de sortie.\n"
+                    "5. Teste le finaliste dans le **Simulateur** avant de passer l'ordre.\n\n"
+                    "Le moat ne se mesure pas automatiquement : pour une ligne risquée (vol EWMA au-dessus de 40 %), c'est à toi de l'identifier.")
+
+# ================================================================== RÉÉQUILIBRAGE
+def page_reequilibrage():
+    st.subheader("Rééquilibrage")
+    st.caption("Calcule les ordres pour revenir aux poids cibles, après les sorties et les entrées que tu choisis, avec une bande de tolérance pour ne pas "
+               "trader pour quelques euros. Les prix sont ceux de Yahoo : les montants réels sur NextWise différeront un peu.")
+    sorties_regle = [t for t, r in pf.iterrows() if pd.notna(r.get("momentum")) and r["momentum"] < LIM["momentum"]]
+    c1, c2 = st.columns(2)
+    a_vendre = c1.multiselect("Lignes à vendre entièrement", list(pf.index), default=sorties_regle, format_func=lambda t: pf.loc[t, "nom"], placeholder="Aucune",
+                              help="Par défaut : les lignes dont le momentum 12-1 est sous −20 % (ta règle de sortie).")
+    univ_all = charger_univers()
+    choix_ach = [t for t in univ_all.index if t not in pf.index]
+    a_acheter = c2.multiselect("Nouvelles lignes à acheter", choix_ach, format_func=lambda t: f"{univ_all.loc[t, 'nom']} ({t})", placeholder="Choisis un ou plusieurs titres")
+    c3, c4 = st.columns(2)
+    bande = c3.slider("Bande de tolérance (points de poids)", 0.0, 2.0, 0.5, 0.1,
+                      help="On ne corrige une ligne que si son poids s'écarte de la cible de plus de cette valeur.") / 100
+    cash_cible = c4.slider("Cash visé (% du total)", 0.0, 10.0, 2.0, 0.5) / 100
+    # cibles
+    cibles = {}
+    for t, r in pf.iterrows():
+        if t in a_vendre:
+            cibles[t] = 0.0
+            continue
+        base_c = r["poids_cible"] if pd.notna(r.get("poids_cible")) else POIDS_BASE
+        if pd.notna(r.get("vol_ewma")) and r["vol_ewma"] > LIM["vol_reduite"]:
+            base_c = min(base_c, POIDS_REDUIT)
+        cibles[t] = base_c
+    prix_new, nom_new, sect_new, place_new = {}, {}, {}, {}
+    if a_acheter:
+        pu2, bu2, uu2 = prix_univers(False)
+        st_n = stats_lignes(pu2[[t for t in a_acheter if t in pu2.columns]].join(bu2.rename(BENCH_PRINCIPAL)), BENCH_PRINCIPAL) if bu2 is not None else pd.DataFrame()
+        for t in a_acheter:
+            if t in pu2.columns and pu2[t].dropna().shape[0]:
+                prix_new[t] = float(pu2[t].dropna().iloc[-1])
+                nom_new[t], sect_new[t], place_new[t] = uu2.loc[t, "nom"], uu2.loc[t, "secteur"], uu2.loc[t, "place"]
+                v = st_n["vol_ewma"].get(t, np.nan) if len(st_n) else np.nan
+                cibles[t] = POIDS_REDUIT if pd.notna(v) and v > LIM["vol_reduite"] else POIDS_BASE
+    somme = sum(cibles.values())
+    if somme > 1 - cash_cible:
+        k = (1 - cash_cible) / somme
+        cibles = {t: x * k for t, x in cibles.items()}
+        st.caption(f"Les cibles dépassaient {pct(1 - cash_cible, 0)} investi : elles ont été réduites proportionnellement (× {k:.3f}).".replace(".", ",", 1))
+    ordres = []
+    for t, cible in cibles.items():
+        if t in pf.index:
+            r = pf.loc[t]
+            cours, qte, poids_av = r["cours"], r["quantite"], r["poids"]
+            nom_ = r["nom"]
+        else:
+            cours, qte, poids_av, nom_ = prix_new.get(t, np.nan), 0.0, 0.0, nom_new.get(t, t)
+        if pd.isna(cours) or cours <= 0:
+            continue
+        if cible == 0 and qte > 0:
+            dq = -qte
+        elif abs(cible - poids_av) <= bande and qte > 0:
+            dq = 0
+        else:
+            dq = int(np.floor((cible * total - qte * cours) / cours)) if cible > poids_av else -int(np.floor((qte * cours - cible * total) / cours))
+        ordres.append({"ticker": t, "nom": nom_, "poids_avant": poids_av, "cible": cible, "quantite_avant": qte, "ordre": dq,
+                       "sens": "Achat" if dq > 0 else ("Vente" if dq < 0 else "—"), "cours": cours, "montant": dq * cours,
+                       "quantite_apres": qte + dq})
+    od = pd.DataFrame(ordres).set_index("ticker")
+    cash_apres = cash - od["montant"].sum()
+    od["poids_apres"] = od["quantite_apres"] * od["cours"] / total
+    m = st.columns(4)
+    kpi(m[0], "Ordres à passer", int((od["ordre"] != 0).sum()))
+    kpi(m[1], "Montant échangé", eur(od["montant"].abs().sum()), f"{pct(od['montant'].abs().sum() / total)} du portefeuille")
+    kpi(m[2], "Cash après", eur(cash_apres), f"{pct(cash_apres / total)} du total")
+    if cash_apres < 0:
+        kpi(m[3], "Attention", "cash négatif")
+        st.error("Les achats dépassent le cash disponible : réduis les cibles ou vends davantage.")
+    elif cash_apres / total > cash_cible + 0.02:
+        st.info(f"Il resterait {pct(cash_apres / total)} de cash pour une cible de {pct(cash_cible, 0)} : choisis des remplaçants dans « Nouvelles lignes à acheter » "
+                "(l'écran des candidats t'aide à les trouver).")
+    passe = od[od["ordre"] != 0].copy()
+    if len(passe):
+        st.markdown("### Ordres proposés")
+        tableau(passe[["nom", "sens", "ordre", "cours", "montant", "poids_avant", "poids_apres", "cible"]].style.format(
+            {"ordre": lambda v: f"{int(v):+d}", "cours": lambda v: eur(v, 2), "montant": lambda v: eur(v), "poids_avant": lambda v: pct(v),
+             "poids_apres": lambda v: pct(v), "cible": lambda v: pct(v)}).map(lambda v: f"color:{C_BON};font-weight:600" if v == "Achat" else (f"color:{C_MAUVAIS};font-weight:600" if v == "Vente" else ""), subset=["sens"]),
+            hide_index=True, column_config={"nom": "Ligne", "sens": "Sens", "ordre": "Quantité", "cours": "Cours estimé", "montant": "Montant",
+                                            "poids_avant": "Poids avant", "poids_apres": "Poids après", "cible": "Cible"})
+    else:
+        st.success("Aucun ordre nécessaire : toutes les lignes sont dans la bande de tolérance.")
+    # contraintes et risque après
+    apres = od[od["quantite_apres"] > 0].copy()
+    apres["poids"] = apres["poids_apres"]
+    apres["secteur"] = [pf["secteur"].get(t) if t in pf.index else sect_new.get(t) for t in apres.index]
+    apres["place"] = [pf["place"].get(t) if t in pf.index else place_new.get(t) for t in apres.index]
+    st.markdown("### Après les ordres")
+    tableau(contraintes(apres).style.format({"niveau": lambda v: pct(v), "limite": lambda v: "≤ " + pct(v, 0)}).map(couleur_etat, subset=["etat"]),
+            hide_index=True, column_config={"regle": "Règle", "niveau": "Niveau", "limite": "Limite", "etat": "État"})
+    adj_r = adj_eur
+    if a_acheter:
+        pu2, _, _ = prix_univers(False)
+        adj_r = adj_eur.join(pu2[[t for t in a_acheter if t in pu2.columns and t not in adj_eur.columns]], how="left")
+    r_ap = risque_portefeuille(apres["poids"], adj_r, BENCH_PRINCIPAL)
+    if r_ap and risque:
+        c = st.columns(3)
+        kpi(c[0], "Volatilité prévue", pct(r_ap["vol"]), pct(r_ap["vol"] - risque["vol"], 2, True), delta_color="inverse")
+        kpi(c[1], "Ratio de diversification", f"{r_ap['dr']:.2f}".replace(".", ","), f"{r_ap['dr'] - risque['dr']:+.2f}".replace(".", ","))
+        kpi(c[2], "Bêta", f"{r_ap['beta']:.2f}".replace(".", ","), f"{r_ap['beta'] - risque['beta']:+.2f}".replace(".", ","))
+    if len(passe):
+        st.markdown("### Lignes à copier dans le journal")
+        st.caption("Une fois les ordres exécutés sur NextWise, remplace les prix estimés par les prix réels (montant ÷ quantité), puis colle ces lignes à la fin de transactions.csv.")
+        jour = dt.datetime.now(TZ).strftime("%Y-%m-%d")
+        texte = "\n".join(f"{jour},{t},{'Achat' if r['ordre'] > 0 else 'Vente'},{abs(int(r['ordre']))},{r['cours']:.4f},,prix estimé à corriger" for t, r in passe.iterrows())
+        st.code(texte, language=None)
+    st.caption("La bande de tolérance limite les allers-retours inutiles : corriger un écart de quelques dixièmes de point coûte plus en frais et en "
+               "bruit qu'il ne rapporte (Masters, 2003 ; Leland, 1999).")
+
+
+    st.markdown("### Test de la page blanche")
+    intro("Pour chaque ligne : si tu ne l'avais pas, tes règles te la feraient-elles acheter aujourd'hui ? Une ligne qui échoue n'est pas forcément à vendre, "
+          "mais tu dois pouvoir justifier par écrit pourquoi tu la gardes. C'est la parade la plus simple à l'effet de disposition.")
+    pb = regles_lignes[regles_lignes["ecarts"] > 0]
+    if pb.empty:
+        st.success("Toutes tes lignes passent le test : tes règles te les feraient toutes acheter aujourd'hui.")
+    else:
+        noms_r = {"momentum": "momentum négatif", "loterie": "hausse de plus de 8 % en un jour", "roe": "ROE sous 10 %", "dette": "dette au-dessus de 3",
+                  "valorisation": "valorisation hors critères", "correlation": "corrélation de 0,7 ou plus", "taille": "poids trop élevé",
+                  "ligne_risquee": "règle des lignes risquées"}
+        for t, r in pb.sort_values("ecarts", ascending=False).iterrows():
+            raisons = [v for k_, v in noms_r.items() if r[k_] == "✗"]
+            verdict = pf["verdict"].get(t)
+            st.markdown(f"- **{r['nom']}** : {', '.join(raisons)}." + (f" Décision déjà écrite : *{verdict}*." if isinstance(verdict, str) and verdict else ""))
+
 # ================================================================== SIMULATEUR
-if page == "Simulateur":
+def page_simulateur():
     st.subheader("Tester un ordre avant de le passer")
     st.caption("Modifie les poids, ajoute une ligne avec son ticker Yahoo (ex. ENEL.MI) ou mets un poids à 0 pour une vente. Le reste va en cash.")
     base = pf[["nom", "poids", "secteur", "place"]].copy()
@@ -1240,15 +1979,18 @@ if page == "Simulateur":
     else:
         apres = risque_portefeuille(w_sim, adj_sim, BENCH_PRINCIPAL)
         if apres and risque:
+            st.markdown("### Effet de l'ordre sur le risque")
             c = st.columns(5)
-            c[0].metric("Volatilité", pct(apres["vol"]), pct(apres["vol"] - risque["vol"], 2, True), delta_color="inverse")
-            c[1].metric("Ratio de diversification", f"{apres['dr']:.2f}".replace(".", ","), f"{apres['dr'] - risque['dr']:+.2f}".replace(".", ","))
-            c[2].metric("Bêta", f"{apres['beta']:.2f}".replace(".", ","), f"{apres['beta'] - risque['beta']:+.2f}".replace(".", ","), delta_color="off")
-            c[3].metric("VaR 95 % sur un jour", pct(apres["var95"], 2), pct(apres["var95"] - risque["var95"], 2, True), delta_color="inverse")
-            c[4].metric("Cash", pct(1 - w_sim.sum()), pct((1 - w_sim.sum()) - cash / total, 1, True), delta_color="off")
+            kpi(c[0], "Volatilité", pct(apres["vol"]), pct(apres["vol"] - risque["vol"], 2, True), delta_color="inverse")
+            kpi(c[1], "Ratio de diversification", f"{apres['dr']:.2f}".replace(".", ","), f"{apres['dr'] - risque['dr']:+.2f}".replace(".", ","))
+            kpi(c[2], "Bêta", f"{apres['beta']:.2f}".replace(".", ","), f"{apres['beta'] - risque['beta']:+.2f}".replace(".", ","))
+            kpi(c[3], "VaR 95 % sur un jour", pct(apres["var95"], 2), pct(apres["var95"] - risque["var95"], 2, True), delta_color="inverse")
+            kpi(c[4], "Cash", pct(1 - w_sim.sum()), pct((1 - w_sim.sum()) - cash / total, 1, True))
+            st.markdown("### Contraintes après l'ordre")
             cs = contraintes(edit[edit["poids"] > 0].set_index("ticker"))
             tableau(cs.style.format({"niveau": lambda v: pct(v), "limite": lambda v: "≤ " + pct(v, 0)}).map(couleur_etat, subset=["etat"]),
                          hide_index=True, column_config={"regle": "Règle après l'ordre", "niveau": "Niveau", "limite": "Limite", "etat": "État"})
+            st.markdown("### Crises rejouées, avant et après")
             s_av, s_ap = stress(poids, adj_sim, BENCH_PRINCIPAL), stress(w_sim, adj_sim, BENCH_PRINCIPAL)
             if not s_av.empty and not s_ap.empty:
                 comp = s_av[["scenario", "portefeuille"]].merge(s_ap[["scenario", "portefeuille"]], on="scenario", suffixes=("_avant", "_apres"))
@@ -1257,7 +1999,7 @@ if page == "Simulateur":
                              hide_index=True, column_config={"scenario": "Crise rejouée", "portefeuille_avant": "Avant", "portefeuille_apres": "Après", "ecart": "Écart"})
 
 # ================================================================== STRESS
-if page == "Stress tests":
+def page_stress():
     st.subheader("Si une crise passée se répétait")
     st.caption("Les poids d'aujourd'hui appliqués aux vrais cours de chaque crise. Une ligne qui n'existait pas encore reçoit le rendement moyen des autres.")
     st_df = stress(poids, adj_eur, BENCH_PRINCIPAL)
@@ -1268,15 +2010,70 @@ if page == "Stress tests":
         fig.add_trace(go.Bar(y=st_df["scenario"], x=st_df["portefeuille"], name="Portefeuille", orientation="h", text=[pct(v, 1, True) for v in st_df["portefeuille"]], textposition="outside"))
         fig.add_trace(go.Bar(y=st_df["scenario"], x=st_df["reference"], name="Euronext 100", orientation="h", marker_color=C_NEUTRE))
         fig.update_layout(barmode="group", height=460, xaxis_tickformat=".0%", margin=dict(t=10, l=0, r=40, b=0), legend=dict(orientation="h", y=1.06))
-        st.plotly_chart(fig, key="stress")
+        graphe(fig, key="stress")
         tableau(st_df.style.format({"portefeuille": lambda v: pct(v, 1, True), "reference": lambda v: pct(v, 1, True), "couverture": lambda v: pct(v, 0)}),
                      hide_index=True, column_config={"scenario": "Crise", "portefeuille": "Portefeuille", "reference": "Euronext 100", "couverture": "Capital avec historique"})
     st.subheader("Choc de marché instantané")
     choc = st.slider("Baisse de l'Euronext 100", -40, 0, -10, format="%d %%")
     if risque and pd.notna(risque["beta"]):
         perte = risque["beta"] * choc / 100
-        st.metric("Perte estimée du portefeuille", pct(perte, 1, True), eur(perte * total))
+        kpi(st, "Perte estimée du portefeuille", pct(perte, 1, True), eur(perte * total))
         st.caption("Estimation par le bêta : elle suppose que les corrélations restent normales, ce qui sous-estime la perte dans une vraie crise.")
+
+
+    st.markdown("### Scénarios à curseurs")
+    intro("L'impact estimé d'un choc combiné, à partir de la sensibilité de chacune de tes lignes au marché, au pétrole, au dollar et aux taux "
+          "(régression sur deux ans de cours quotidiens).")
+    mac = series_macro()
+    r_m = adj_eur[BENCH_PRINCIPAL].pct_change(fill_method=None)
+    morceaux = [r_m.rename("Marché (Euronext 100)")] + ([mac.pct_change(fill_method=None)] if not mac.empty else [])
+    fac_s = pd.concat(morceaux, axis=1).iloc[-504:]
+    R_l = adj_eur[[t for t in poids.index if t in adj_eur.columns]].pct_change(fill_method=None).reindex(fac_s.index)
+    sens = A.sensibilites(R_l, fac_s.dropna())
+    if sens.empty:
+        st.info("Données de marché insuffisantes pour estimer les sensibilités.")
+    else:
+        cols_s = list(sens.columns)
+        chocs = {}
+        cc = st.columns(len(cols_s))
+        defs = {"Marché (Euronext 100)": (-40, 20, -10), "Pétrole (Brent)": (-50, 80, 0), "Euro / dollar": (-15, 15, 0), "Obligations d'État € (prix)": (-12, 6, 0)}
+        aides = {"Euro / dollar": "Positif : l'euro monte face au dollar.", "Obligations d'État € (prix)": "Environ −7 % pour une hausse de 1 point des taux longs."}
+        for i, ccol in enumerate(cols_s):
+            lo, hi, dv = defs.get(ccol, (-30, 30, 0))
+            chocs[ccol] = cc[i].slider(ccol, lo, hi, dv, format="%d %%", key=f"choc_{i}", help=aides.get(ccol)) / 100
+        imp = sens[cols_s].mul(pd.Series(chocs)).sum(axis=1)
+        w_ = poids.reindex(imp.index).fillna(0)
+        tot_imp = float((w_ * imp).sum())
+        c = st.columns(2)
+        kpi(c[0], "Impact estimé sur le portefeuille", pct(tot_imp, 1, True), eur(tot_imp * total))
+        kpi(c[1], "Ligne la plus touchée", pf["nom"].get(imp.idxmin(), imp.idxmin()), pct(imp.min(), 1, True))
+        contrib = (w_ * imp).sort_values()
+        fig = go.Figure(go.Bar(x=contrib.values, y=[pf["nom"].get(t, t) for t in contrib.index], orientation="h",
+                               marker_color=[C_BON if v >= 0 else C_MAUVAIS for v in contrib.values],
+                               text=[pct(v, 2, True) for v in contrib.values], textposition="outside"))
+        fig.update_layout(height=max(320, 22 * len(contrib)), xaxis_tickformat="+.1%", margin=dict(t=30, l=0, r=50, b=0),
+                          title=dict(text="Contribution de chaque ligne à l'impact (poids × choc)", font_size=13))
+        graphe(fig, key="chocs")
+        st.caption("Modèle linéaire en temps normal : il sous-estime les vraies crises, où les corrélations montent. Les sensibilités sont estimées sur deux ans "
+                   "et changent avec le temps. Pour Equinor et Ryanair, le curseur pétrole montre bien leur rôle de contrepoids.")
+
+    st.markdown("### Les 13 scénarios d'APTimum")
+    intro("Les scénarios du rapport APTimum du 30/10/2026, calculés par leur modèle de risque sur les 21 lignes détenues à cette date. "
+          "Ils complètent tes crises rejouées : mêmes ordres de grandeur, méthode différente.")
+    try:
+        ap = pd.read_csv(os.path.join(ICI, "aptimum.csv"))
+    except Exception:
+        ap = pd.DataFrame()
+    if not ap.empty:
+        ap = ap.iloc[::-1]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(y=ap["scenario"], x=ap["portefeuille"], name="Portefeuille", orientation="h", marker_color=PALETTE[0],
+                             text=[pct(v, 1, True) for v in ap["portefeuille"]], textposition="outside"))
+        fig.add_trace(go.Bar(y=ap["scenario"], x=ap["reference"], name="Référence", orientation="h", marker_color="#9aa4b2"))
+        fig.update_layout(barmode="group", height=560, xaxis_tickformat=".0%", margin=dict(t=10, l=0, r=40, b=0), legend=dict(orientation="h", y=1.04))
+        graphe(fig, key="aptimum")
+        mieux = int((ap["portefeuille"] > ap["reference"]).sum())
+        st.caption(f"Tu perds moins que la référence dans {mieux} scénarios sur {len(ap)}. Pour mettre à jour, remplace aptimum.csv par les chiffres du nouveau rapport.")
 
 # ================================================================== CHANCE OU TALENT
 @st.cache_data(ttl=3600, show_spinner="Bootstrap en cours…")
@@ -1296,7 +2093,7 @@ def lire_participants(fichier):
     return d, None
 
 
-if page == "Chance ou talent":
+def page_chance():
     st.subheader("Chance ou talent ?")
     st.caption("La page suit la démarche de ton TFE : d'abord ce que le hasard seul peut produire (Monte Carlo), "
                "puis un test sur tes vrais rendements sans supposer de loi normale (bootstrap), enfin la correction "
@@ -1344,10 +2141,10 @@ if page == "Chance ou talent":
         st.caption(f"Du {res['debut']:%d/%m/%Y} au {res['fin']:%d/%m/%Y} · {cle[0].lower()} ({res['univers_n']} titres) · "
                    f"{res['n_lignes']} lignes · {pct(res['investi'], 0)} investi")
         m = st.columns(4)
-        m[0].metric("Ton rendement", pct(rm, 2, True), f"Euronext 100 {pct(res['bench'], 2, True)}", delta_color="off")
-        m[1].metric("Mieux que", pct(pct_tous, 0), "de tous les portefeuilles aléatoires", delta_color="off")
-        m[2].metric("À risque égal, mieux que", pct(pct_risque, 0), f"{int(proches.sum())} portefeuilles à ± {pct(bande, 0)} de vol", delta_color="off")
-        m[3].metric("p-valeur", f"{p_val:.2f}".replace(".", ","), "le hasard fait aussi bien dans cette part des cas", delta_color="off")
+        kpi(m[0], "Ton rendement", pct(rm, 2, True), f"Euronext 100 {pct(res['bench'], 2, True)}")
+        kpi(m[1], "Mieux que", pct(pct_tous, 0), "de tous les portefeuilles aléatoires")
+        kpi(m[2], "À risque égal, mieux que", pct(pct_risque, 0), f"{int(proches.sum())} portefeuilles à ± {pct(bande, 0)} de vol")
+        kpi(m[3], "p-valeur", f"{p_val:.2f}".replace(".", ","), "le hasard fait aussi bien dans cette part des cas")
         if p_val < 0.05:
             st.success("Sur cette période, le hasard explique difficilement ton résultat. Une seule période ne prouve pas un talent : refais le test chaque mois.")
         elif p_val > 0.5:
@@ -1364,7 +2161,7 @@ if page == "Chance ou talent":
                 fig.add_vline(x=res["bench"], line_color=C_NEUTRE, line_dash="dot", annotation_text="Euronext 100", annotation_position="bottom right")
             fig.update_layout(barmode="overlay", height=340, xaxis_tickformat="+.1%", margin=dict(t=30, l=0, r=0, b=0),
                               legend=dict(orientation="h", y=1.12), yaxis_title="portefeuilles")
-            st.plotly_chart(fig, key="alea_hist")
+            graphe(fig, key="alea_hist")
         with d:
             fig = go.Figure()
             fig.add_trace(go.Scattergl(x=va, y=ra, mode="markers", marker=dict(size=3, color="#9e9e9e", opacity=0.35), name="Aléatoires",
@@ -1373,7 +2170,7 @@ if page == "Chance ou talent":
                                      text=["toi"], textposition="top center", name="Ton portefeuille"))
             fig.update_layout(height=340, xaxis_tickformat=".0%", yaxis_tickformat="+.1%", xaxis_title="volatilité prévue",
                               yaxis_title="rendement", margin=dict(t=30, l=0, r=0, b=0), showlegend=False)
-            st.plotly_chart(fig, key="alea_nuage")
+            graphe(fig, key="alea_nuage")
         if res.get("survie") is not None and not res["survie"].empty:
             st.markdown("**Tableau de survie, mois par mois** (la méthode de Tarnavskyi appliquée à toi)")
             st.caption("Chaque mois : la part des portefeuilles aléatoires qui battent l'indice, et ta place parmi eux. Battre l'indice un mois où 80 % des tirages le battent ne dit rien de toi.")
@@ -1415,17 +2212,17 @@ if page == "Chance ou talent":
         st.markdown("**a) Tes rendements suivent-ils une loi normale ?** (Heyman et al., 2014 ; Van Heerden, 2015)")
         nm = A.normalite(r_test)
         c = st.columns(4)
-        c[0].metric("Asymétrie", f"{nm['asymetrie']:+.2f}".replace(".", ","), "0 pour une loi normale", delta_color="off")
-        c[1].metric("Kurtosis", f"{nm['kurtosis']:.2f}".replace(".", ","), "3 pour une loi normale", delta_color="off")
-        c[2].metric("Jarque-Bera, p", f"{nm['jb_p']:.3f}".replace(".", ","), "sous 0,05 : pas normale", delta_color="off")
-        c[3].metric("Shapiro-Wilk, p", f"{nm['sw_p']:.3f}".replace(".", ","), "sous 0,05 : pas normale", delta_color="off")
+        kpi(c[0], "Asymétrie", f"{nm['asymetrie']:+.2f}".replace(".", ","), "0 pour une loi normale")
+        kpi(c[1], "Kurtosis", f"{nm['kurtosis']:.2f}".replace(".", ","), "3 pour une loi normale")
+        kpi(c[2], "Jarque-Bera, p", f"{nm['jb_p']:.3f}".replace(".", ","), "sous 0,05 : pas normale")
+        kpi(c[3], "Shapiro-Wilk, p", f"{nm['sw_p']:.3f}".replace(".", ","), "sous 0,05 : pas normale")
         x = r_test.values
         fig = go.Figure(go.Histogram(x=x, nbinsx=40, histnorm="probability density", name="Tes rendements quotidiens", marker_color="#4c78a8", opacity=0.75))
         grille = np.linspace(x.min(), x.max(), 200)
         fig.add_trace(go.Scatter(x=grille, y=A.stats.norm.pdf(grille, x.mean(), x.std(ddof=1)), name="Loi normale de même moyenne et écart-type",
                                  line=dict(color=C_MAUVAIS, width=2)))
         fig.update_layout(height=280, xaxis_tickformat="+.1%", margin=dict(t=10, l=0, r=0, b=0), legend=dict(orientation="h", y=1.15))
-        st.plotly_chart(fig, key="normalite")
+        graphe(fig, key="normalite")
         if min(nm["jb_p"], nm["sw_p"]) < 0.05:
             st.caption("La loi normale est rejetée : les tests classiques (t de Jensen, Sharpe) sont donc biaisés, d'où le bootstrap ci-dessous.")
         else:
@@ -1435,15 +2232,15 @@ if page == "Chance ou talent":
         bt = bootstrap_cache(r_test, r_bench)
         if bt:
             c = st.columns(4)
-            c[0].metric("Alpha annualisé", pct(bt["alpha"] * 252, 1, True))
-            c[1].metric("t de l'alpha", f"{bt['t_alpha']:+.2f}".replace(".", ","), f"bêta {bt['beta']:.2f}".replace(".", ","), delta_color="off")
-            c[2].metric("p-valeur classique (loi normale)", f"{bt['p_param']:.3f}".replace(".", ","))
-            c[3].metric("p-valeur bootstrap", f"{bt['p_boot']:.3f}".replace(".", ","), "celle qu'il faut retenir", delta_color="off")
+            kpi(c[0], "Alpha annualisé", pct(bt["alpha"] * 252, 1, True))
+            kpi(c[1], "t de l'alpha", f"{bt['t_alpha']:+.2f}".replace(".", ","), f"bêta {bt['beta']:.2f}".replace(".", ","))
+            kpi(c[2], "p-valeur classique (loi normale)", f"{bt['p_param']:.3f}".replace(".", ","))
+            kpi(c[3], "p-valeur bootstrap", f"{bt['p_boot']:.3f}".replace(".", ","), "celle qu'il faut retenir")
             fig = go.Figure(go.Histogram(x=bt["t_boot"], nbinsx=60, marker_color="#c7c7c7", name="Monde sans talent"))
             fig.add_vline(x=bt["t_alpha"], line_color=C_MAUVAIS, line_width=2, annotation_text="toi", annotation_position="top")
             fig.add_vline(x=2, line_color=C_NEUTRE, line_dash="dot", annotation_text="t = 2", annotation_position="bottom right")
             fig.update_layout(height=260, margin=dict(t=30, l=0, r=0, b=0), xaxis_title="t de l'alpha dans 2 000 mondes sans talent", showlegend=False)
-            st.plotly_chart(fig, key="boot")
+            graphe(fig, key="boot")
             st.caption("On garde tes vrais résidus et le vrai marché, on force l'alpha à zéro, puis on rééchantillonne par blocs de quelques jours pour garder "
                        "l'enchaînement des séances. Si ton t dépasse rarement ceux de ce monde, l'alpha est difficile à attribuer à la chance. "
                        "Avec beaucoup d'essais de stratégies, exige un t au-delà de 3 (Harvey, Liu et Zhu, 2016).")
@@ -1452,22 +2249,22 @@ if page == "Chance ou talent":
         ps = A.sharpe_probabiliste(r_test)
         if ps:
             c = st.columns(3)
-            c[0].metric("Sharpe annualisé", f"{ps['sr_annuel']:.2f}".replace(".", ","))
-            c[1].metric("Probabilité que le vrai Sharpe soit positif", pct(ps["psr"], 0))
-            c[2].metric("Même calcul en supposant la loi normale", pct(ps["psr_normal"], 0), pct(ps["psr"] - ps["psr_normal"], 0, True), delta_color="off")
+            kpi(c[0], "Sharpe annualisé", f"{ps['sr_annuel']:.2f}".replace(".", ","))
+            kpi(c[1], "Probabilité que le vrai Sharpe soit positif", pct(ps["psr"], 0))
+            kpi(c[2], "Même calcul en supposant la loi normale", pct(ps["psr_normal"], 0), pct(ps["psr"] - ps["psr_normal"], 0, True))
             st.caption("L'écart entre les deux probabilités, c'est ce que coûte le fait d'ignorer l'asymétrie et les queues épaisses de tes rendements.")
 
     st.markdown("**d) Portefeuilles jumeaux : battre des actions qui te ressemblent** (Daniel et al., 1997 ; Heyman et al., 2014)")
     if res and res.get("jumeaux"):
         jm = res["jumeaux"]
         c = st.columns(3)
-        c[0].metric("Ton rendement", pct(jm["r_moi"], 2, True))
-        c[1].metric("Mieux que tes jumeaux dans", pct(jm["percentile"], 0), "des 10 000 tirages", delta_color="off")
-        c[2].metric("p-valeur", f"{jm['p']:.2f}".replace(".", ","))
+        kpi(c[0], "Ton rendement", pct(jm["r_moi"], 2, True))
+        kpi(c[1], "Mieux que tes jumeaux dans", pct(jm["percentile"], 0), "des 10 000 tirages")
+        kpi(c[2], "p-valeur", f"{jm['p']:.2f}".replace(".", ","))
         fig = go.Figure(go.Histogram(x=jm["r_jumeaux"], nbinsx=70, marker_color="#c7c7c7"))
         fig.add_vline(x=jm["r_moi"], line_color=C_MAUVAIS, line_width=2, annotation_text="toi", annotation_position="top")
         fig.update_layout(height=240, xaxis_tickformat="+.1%", margin=dict(t=30, l=0, r=0, b=0), showlegend=False)
-        st.plotly_chart(fig, key="jumeaux")
+        graphe(fig, key="jumeaux")
         st.caption("Chaque ligne est remplacée par une action tirée au hasard du même secteur, du même tiers de momentum et du même tiers de volatilité. "
                    "Si tu bats tes jumeaux, la performance vient du choix des titres, pas d'une simple exposition au momentum, au secteur ou au risque.")
         det = jm["details"].copy()
@@ -1509,17 +2306,17 @@ if page == "Chance ou talent":
             st.warning("Il faut au moins 20 participants avec une performance et un risque.")
         else:
             c = st.columns(4)
-            c[0].metric("Participants", fd["N"])
-            c[1].metric("Sans talent (alpha nul)", pct(fd["pi0"], 0))
-            c[2].metric("Vraiment meilleurs que l'indice", pct(fd["pi_plus"], 1))
-            c[3].metric("Vraiment moins bons", pct(fd["pi_moins"], 1))
+            kpi(c[0], "Participants", fd["N"])
+            kpi(c[1], "Sans talent (alpha nul)", pct(fd["pi0"], 0))
+            kpi(c[2], "Vraiment meilleurs que l'indice", pct(fd["pi_plus"], 1))
+            kpi(c[3], "Vraiment moins bons", pct(fd["pi_moins"], 1))
             st.caption(f"{fd['sig_pos']} participants paraissent significativement meilleurs au seuil de 10 %, mais on en attend environ "
                        f"{fd['faux_attendus']:.0f} par pur hasard : la part de chance parmi ces « gagnants » est estimée à {pct(fd['fdr_plus'], 0)}.")
             fig = go.Figure(go.Histogram(x=fd["table"]["t"], nbinsx=40, histnorm="probability density", marker_color="#4c78a8", opacity=0.75, name="Participants"))
             g_ = np.linspace(-4, 4, 200)
             fig.add_trace(go.Scatter(x=g_, y=A.stats.norm.pdf(g_), name="Si personne n'avait de talent", line=dict(color=C_MAUVAIS, width=2)))
             fig.update_layout(height=260, margin=dict(t=10, l=0, r=0, b=0), xaxis_title="t de chaque participant", legend=dict(orientation="h", y=1.15))
-            st.plotly_chart(fig, key="fdr")
+            graphe(fig, key="fdr")
             st.caption("Limites : un seul instantané, un t approximé à partir du risque annualisé, et des participants qui ne sont pas indépendants "
                        "(beaucoup détiennent les mêmes titres). C'est un ordre de grandeur, comme le rappelle ton TFE.")
     else:
@@ -1535,12 +2332,12 @@ if page == "Chance ou talent":
     enb = A.nombre_effectif_paris(poids, r1)
     c = st.columns(4)
     if reg:
-        c[0].metric("R² face au marché", pct(reg["r2"], 0), "plus bas = plus de sélection", delta_color="off")
+        kpi(c[0], "R² face au marché", pct(reg["r2"], 0), "plus bas = plus de sélection")
         te = (rp - r1[BENCH_PRINCIPAL]).std() * np.sqrt(252)
-        c[1].metric("Écart de suivi", pct(te, 1), "à quel point tu t'écartes de l'indice", delta_color="off")
+        kpi(c[1], "Écart de suivi", pct(te, 1), "à quel point tu t'écartes de l'indice")
     if enb:
-        c[2].metric("Nombre effectif de paris", f"{enb['enb']:.1f}".replace(".", ","), f"pour {enb['n_lignes']} lignes", delta_color="off")
-        c[3].metric("Part du premier facteur", pct(enb["part_premier_facteur"], 0), "le « marché » commun à tes lignes", delta_color="off")
+        kpi(c[2], "Nombre effectif de paris", f"{enb['enb']:.1f}".replace(".", ","), f"pour {enb['n_lignes']} lignes")
+        kpi(c[3], "Part du premier facteur", pct(enb["part_premier_facteur"], 0), "le « marché » commun à tes lignes")
     st.markdown(
         "- **R² faible** : Amihud et Goyenko (2013) montrent que les fonds les moins expliqués par le marché et les facteurs surperforment ensuite.\n"
         "- **Écart à l'indice** : Cremers et Petajisto (2009) trouvent que les fonds qui s'écartent le plus de leur indice font mieux ; c'est contesté par "
@@ -1549,7 +2346,7 @@ if page == "Chance ou talent":
         "- **Meilleures idées** : Cohen, Polk et Silli (2010) montrent que les positions de plus forte conviction surperforment ; trop diluer détruit l'avantage.")
 
 # ================================================================== JOURNAL
-if page == "Journal":
+def page_journal():
     st.subheader("Journal des transactions")
     st.caption("Ajoute chaque ordre exécuté dans l'onglet « transactions » de ton Google Sheet : le site le prend en compte dans la minute.")
     tableau(tx.assign(date=tx["date"].dt.strftime("%d/%m/%Y")), hide_index=True,
@@ -1582,12 +2379,46 @@ if page == "Journal":
         pgr = rg / (rg + pg) if rg + pg else np.nan
         plr = rl / (rl + pl) if rl + pl else np.nan
         c = st.columns(3)
-        c[0].metric("PGR (gains réalisés)", pct(pgr, 0))
-        c[1].metric("PLR (pertes réalisées)", pct(plr, 0))
-        c[2].metric("PGR − PLR", pct(pgr - plr, 0, True), "biais présent" if pgr - plr > 0.05 else "pas de biais net", delta_color="off")
+        kpi(c[0], "PGR (gains réalisés)", pct(pgr, 0))
+        kpi(c[1], "PLR (pertes réalisées)", pct(plr, 0))
+        kpi(c[2], "PGR − PLR", pct(pgr - plr, 0, True), "biais présent" if pgr - plr > 0.05 else "pas de biais net")
+
+
+    st.markdown("### Prévisions et score de Brier")
+    intro("Avant chaque décision, écris une prévision chiffrée dans previsions.csv : par exemple « Ferrari fera mieux que l'Euronext 100 d'ici le 30/11 », "
+          "avec ta probabilité (0,6 pour 60 %). À l'échéance, note le résultat : 1 si c'est arrivé, 0 sinon. Le score de Brier mesure la qualité de ton jugement, "
+          "indépendamment de la chance d'un résultat isolé (Brier, 1950 ; Tetlock et Gardner, 2015).")
+    try:
+        pv = pd.read_csv(os.path.join(ICI, "previsions.csv"), dtype=str)
+    except Exception:
+        pv = pd.DataFrame()
+    if pv.empty:
+        st.caption("Aucune prévision pour l'instant. Format d'une ligne : 2026-11-05,Ferrari,Fera mieux que l'Euronext 100,0.6,2026-11-30, "
+                   "(laisse le résultat vide jusqu'à l'échéance, puis mets 1 ou 0).")
+    else:
+        pv["probabilite"] = pv["probabilite"].map(num)
+        pv["resultat"] = pv["resultat"].map(num)
+        tableau(pv.style.format({"probabilite": lambda v: pct(v, 0), "resultat": lambda v: "—" if pd.isna(v) else ("oui" if v == 1 else "non")}),
+                hide_index=True, column_config={"date": "Date", "ligne": "Ligne", "prevision": "Prévision", "probabilite": "Probabilité",
+                                                "echeance": "Échéance", "resultat": "Arrivé ?"})
+        sb = A.score_brier(pv)
+        if sb:
+            c = st.columns(4)
+            kpi(c[0], "Prévisions résolues", sb["n"])
+            kpi(c[1], "Score de Brier", f"{sb['brier']:.3f}".replace(".", ","), "0 = parfait, 0,25 = pile ou face")
+            kpi(c[2], "Taux de réussite", pct(sb["taux_reussite"], 0))
+            kpi(c[3], "Gain sur une prévision naïve", pct(sb["skill"], 0), "au-dessus de 0 : tu apportes de l'information")
+            cal = sb["calibration"]
+            if len(cal) >= 2:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", line=dict(dash="dot", color="#9aa4b2"), name="Calibration parfaite"))
+                fig.add_trace(go.Scatter(x=cal["prevu"], y=cal["realise"], mode="markers+lines", marker=dict(size=10 + 2 * cal["n"]), name="Toi"))
+                fig.update_layout(height=300, xaxis_tickformat=".0%", yaxis_tickformat=".0%", xaxis_title="probabilité annoncée", yaxis_title="fréquence réelle",
+                                  margin=dict(t=10, l=0, r=0, b=0))
+                graphe(fig, key="calib")
 
 # ================================================================== DONNÉES
-if page == "Données":
+def page_donnees():
     st.subheader("Contrôle de la qualité des données")
     rows = []
     aujourdhui = pd.Timestamp.now(tz=TZ).normalize().tz_localize(None)
@@ -1605,3 +2436,306 @@ if page == "Données":
                  hide_index=True, column_config={"ticker": "Ticker", "dernier_jour": "Dernier cours", "jours": "Jours d'historique", "saut_max_30j": "Plus fort mouvement sur 30 jours", "etat": "État"})
     st.caption("Un « saut suspect » peut être une vraie nouvelle (résultats) ou une erreur d'ajustement de Yahoo : compare avec NextWise.")
     st.caption("Devises converties en euros : " + (", ".join(f"{t} ({d})" for t, d in devises.items() if d != "EUR") or "aucune"))
+
+
+# ================================================================== OPTIMISATION
+@st.cache_data(ttl=3600, show_spinner="Optimisation…")
+def optim_cache(R, borne, investi):
+    cov = R.cov().values * 252
+    res = {}
+    for mode in ["minvar", "mdp", "erc"]:
+        res[mode] = A.optimiser(cov, mode, borne) * investi
+    return res, cov
+
+
+def page_optimisation():
+    st.subheader("Optimisation")
+    intro("Ce que donneraient tes 25 lignes avec d'autres règles de pondération. Les trois portefeuilles optimisés n'utilisent <b>que le risque</b> "
+          "(volatilités et corrélations), jamais de prévision de rendement : c'est volontaire. Les optimisations qui prévoient les rendements sont si "
+          "sensibles aux erreurs d'estimation qu'elles font souvent moins bien que les poids égaux (Michaud, 1989 ; DeMiguel, Garlappi et Uppal, 2009).")
+    t_ok = [t for t in poids.index if t in adj_eur.columns and adj_eur[t].iloc[-252:].notna().sum() > 200]
+    R = adj_eur[t_ok].pct_change(fill_method=None).iloc[-252:].fillna(0)
+    investi = float(poids.reindex(t_ok).sum())
+    borne = st.slider("Poids maximum par ligne", 4.0, 10.0, 6.0, 0.5, format="%.1f %%",
+                      help="10 % est la limite UCITS. Plus bas, les portefeuilles restent proches des poids égaux.") / 100
+    res, cov = optim_cache(R, borne / max(investi, 1e-9), investi)
+    sig = np.sqrt(np.diag(cov))
+    mu = (adj_eur[t_ok].iloc[-1] / adj_eur[t_ok].iloc[-253] - 1).values
+    rb = adj_eur[BENCH_PRINCIPAL].pct_change(fill_method=None).iloc[-252:]
+    portefeuilles = {"Ton portefeuille": poids.reindex(t_ok).fillna(0).values, "Poids égaux": np.full(len(t_ok), investi / len(t_ok)),
+                     "Variance minimale": res["minvar"], "Diversification maximale": res["mdp"], "Parité de risque": res["erc"]}
+    lignes_t = []
+    for nom_p, w in portefeuilles.items():
+        v = float(np.sqrt(w @ cov @ w))
+        dr = float((w * sig).sum() / v) if v > 0 else np.nan
+        rp_ = R.values @ w
+        beta = np.cov(rp_, rb.fillna(0).values)[0, 1] / rb.var() if rb.var() > 0 else np.nan
+        sect = pd.Series(w, index=t_ok).groupby(pf["secteur"].reindex(t_ok).fillna("?")).sum()
+        lignes_t.append({"portefeuille": nom_p, "vol": v, "dr": dr, "paris": dr ** 2, "beta": beta, "var95": -np.percentile(rp_, 5),
+                         "max_ligne": w.max(), "max_secteur": sect.max(), "secteur_max": sect.idxmax(), "rend_passe": float(w @ mu)})
+    tb = pd.DataFrame(lignes_t)
+    tableau(tb.style.format({"vol": lambda v: pct(v), "dr": lambda v: f"{v:.2f}".replace(".", ","), "paris": lambda v: f"{v:.1f}".replace(".", ","),
+                             "beta": lambda v: f"{v:.2f}".replace(".", ","), "var95": lambda v: pct(v, 2), "max_ligne": lambda v: pct(v),
+                             "max_secteur": lambda v: pct(v), "rend_passe": lambda v: pct(v, 1, True)})
+            .map(lambda v: f"color:{C_MAUVAIS};font-weight:600" if isinstance(v, float) and v > LIM["secteur"] + 1e-9 else "", subset=["max_secteur"]),
+            hide_index=True,
+            column_config={"portefeuille": "Pondération", "vol": "Volatilité prévue", "dr": "Ratio de diversification", "paris": "Paris indépendants",
+                           "beta": "Bêta", "var95": "VaR 95 % (1 jour)", "max_ligne": "Plus grosse ligne", "max_secteur": "Premier secteur",
+                           "secteur_max": "Lequel", "rend_passe": "Rendement passé 1 an"})
+    st.caption("Le rendement passé est affiché pour information : il ne dit rien du futur et ne sert pas au calcul. En rouge : un secteur au-dessus de ta limite de 20 %.")
+
+    st.markdown("### Les poids, ligne par ligne")
+    wdf = pd.DataFrame({k_: v for k_, v in portefeuilles.items() if k_ != "Poids égaux"}, index=[pf["nom"].get(t, t) for t in t_ok])
+    wdf = wdf.sort_values("Ton portefeuille")
+    fig = go.Figure()
+    for i_, nom_ in enumerate(wdf.index):
+        fig.add_trace(go.Scatter(x=[wdf.loc[nom_].min(), wdf.loc[nom_].max()], y=[nom_, nom_], mode="lines", line=dict(color="rgba(127,127,127,.35)", width=3),
+                                 showlegend=False, hoverinfo="skip"))
+    symb = {"Ton portefeuille": "circle", "Variance minimale": "square", "Diversification maximale": "diamond", "Parité de risque": "triangle-up"}
+    for i, c in enumerate(wdf.columns):
+        fig.add_trace(go.Scatter(x=wdf[c], y=wdf.index, mode="markers", name=c, marker=dict(size=11 if i == 0 else 9, color=PALETTE[i], symbol=symb.get(c, "circle"),
+                                 line=dict(width=1, color="white")), hovertemplate="%{y} · " + c + " : %{x:.2%}<extra></extra>"))
+    fig.add_vline(x=borne, line_dash="dot", line_color="#9aa4b2", annotation_text="poids max")
+    fig.update_layout(height=max(420, 26 * len(wdf)), xaxis_tickformat=".1%", margin=dict(t=10, l=0, r=0, b=0), legend=dict(orientation="h", y=1.04))
+    graphe(fig, key="optim_poids")
+
+    st.markdown("### Le nuage des portefeuilles possibles, en 3D")
+    intro("4 000 pondérations tirées au hasard de tes 25 lignes, plafonnées au poids maximum. Axes : volatilité prévue, ratio de diversification, rendement passé "
+          "sur un an. Couleur : Sharpe passé. Tourne le graphique à la souris. Les losanges sont les cinq pondérations du tableau.")
+    nu = A.nuage_portefeuilles(cov, mu, n=4000, borne=borne / max(investi, 1e-9))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter3d(x=nu["vol"] * investi, y=nu["dr"], z=nu["rendement"] * investi, mode="markers",
+                               marker=dict(size=2.2, color=nu["sharpe"], colorscale="Viridis", opacity=0.55, colorbar=dict(title="Sharpe passé")),
+                               name="Aléatoires", hovertemplate="vol %{x:.1%}<br>diversification %{y:.2f}<br>rendement passé %{z:+.1%}<extra></extra>"))
+    for i, r in tb.iterrows():
+        fig.add_trace(go.Scatter3d(x=[r["vol"]], y=[r["dr"]], z=[r["rend_passe"]], mode="markers+text", text=[r["portefeuille"]],
+                                   marker=dict(size=7, symbol="diamond", color=PALETTE[i % len(PALETTE)]), name=r["portefeuille"]))
+    fig.update_layout(height=620, margin=dict(t=10, l=0, r=0, b=0), showlegend=False,
+                      scene=dict(xaxis=dict(title="volatilité", tickformat=".0%"), yaxis=dict(title="diversification"), zaxis=dict(title="rendement passé", tickformat="+.0%")))
+    graphe(fig, key="nuage3d")
+    st.caption("À lire : la diversification maximale cherche le haut de l'axe « diversification », la variance minimale le bord gauche de l'axe « volatilité ». "
+               "Si ton portefeuille est loin des deux, c'est que tes choix de poids (convictions, règles de volatilité) coûtent de la diversification : à toi de juger si c'est voulu.")
+
+
+# ================================================================== VALORISATION
+def page_valorisation():
+    st.subheader("Valorisation")
+    intro("Ce que tu paies pour la croissance attendue. Les règles : PEG ≤ 2 pour les valeurs de croissance (Lynch), ratio de Lynch ≥ 1 pour les croissances "
+          "lentes à dividende ((croissance + rendement) ÷ PER). Les cycliques ont un PER trompeur (bas au sommet du cycle) et les financières se jugent sur "
+          "le ROE et la valeur comptable : elles sont donc traitées à part.")
+    v = pf[["nom", "type_valo", "per", "croissance", "peg", "lynch", "roe", "diagnostic", "verdict", "poids"]].copy()
+    pts = v.dropna(subset=["per", "croissance"])
+    if pts.empty:
+        st.info("Ajoute PER et croissance dans lignes.csv.")
+        return
+    coul = {"Valorisation OK": PALETTE[0], "Cas 1": "#F59E0B", "Cas 2": "#F97316", "Cas 3": "#EF4444"}
+    fig = go.Figure()
+    xmax = max(0.5, pts["croissance"].max() * 1.1)
+    gg = np.linspace(0.001, xmax, 50)
+    for peg_, dash in [(1, "dot"), (2, "dash")]:
+        fig.add_trace(go.Scatter(x=gg, y=peg_ * gg * 100, mode="lines", line=dict(color="#9aa4b2", dash=dash, width=1), name=f"PEG {peg_}", hoverinfo="skip"))
+    for diag, grp in pts.groupby(pts["diagnostic"].fillna("Valorisation OK")):
+        etiq = [n if (diag != "Valorisation OK" or (pd.notna(p_) and p_ > 2)) else "" for n, p_ in zip(grp["nom"], grp["peg"])]
+        fig.add_trace(go.Scatter(x=grp["croissance"], y=grp["per"], mode="markers+text", text=etiq, textposition="top center", textfont=dict(size=11),
+                                 marker=dict(size=10 + 120 * grp["poids"].fillna(0.03), color=coul.get(diag, "#64748B"), line=dict(width=1, color="white")),
+                                 name=diag, customdata=np.stack([grp["type_valo"].fillna(""), grp["peg"].fillna(np.nan), grp["lynch"].fillna(np.nan)], axis=-1),
+                                 hovertext=grp["nom"], hovertemplate="%{hovertext}<br>PER %{y:.1f} · croissance %{x:+.0%}<br>%{customdata[0]} · PEG %{customdata[1]:.2f} · Lynch %{customdata[2]:.2f}<extra></extra>"))
+    fig.update_layout(height=520, xaxis_tickformat="+.0%", xaxis_title="croissance attendue du bénéfice par action", yaxis_title="PER",
+                      yaxis_range=[0, max(40, pts["per"].max() * 1.1)], margin=dict(t=10, l=0, r=0, b=0), legend=dict(orientation="h", y=1.05))
+    graphe(fig, key="valo")
+    st.caption("Au-dessus de la droite PEG 2, la croissance ne justifie plus le prix. La taille des points suit le poids de la ligne. Données MarketScreener "
+               "saisies dans lignes.csv : mets-les à jour après chaque publication de résultats.")
+    st.markdown("### Les diagnostics")
+    st.markdown("- **Cas 1** : au-dessus du seuil, mais justifié par la qualité et la visibilité (contrats longs, position dominante).\n"
+                "- **Cas 2** : signal de valorisation à analyser : vrai problème ou artefact des données ?\n"
+                "- **Cas 3** : hors critères, décision ou exception écrite obligatoire.")
+    sig_ = v[v["diagnostic"].fillna("").str.startswith("Cas")].sort_values("diagnostic", ascending=False)
+    if len(sig_):
+        tableau(sig_[["nom", "diagnostic", "type_valo", "per", "croissance", "peg", "lynch", "verdict"]].style.format(
+            {"per": lambda x: "—" if pd.isna(x) else f"{x:.1f}".replace(".", ","), "croissance": lambda x: pct(x, 0, True),
+             "peg": lambda x: "—" if pd.isna(x) else f"{x:.2f}".replace(".", ","), "lynch": lambda x: "—" if pd.isna(x) else f"{x:.2f}".replace(".", ",")}),
+            hide_index=True, column_config={"nom": "Ligne", "diagnostic": "Cas", "type_valo": "Type", "per": "PER", "croissance": "Croissance",
+                                            "peg": "PEG", "lynch": "Lynch", "verdict": "Décision"})
+    st.markdown("### Toutes les lignes")
+    tableau(v.sort_values("type_valo")[["nom", "type_valo", "per", "croissance", "peg", "lynch", "roe", "diagnostic"]].style.format(
+        {"per": lambda x: "—" if pd.isna(x) else f"{x:.1f}".replace(".", ","), "croissance": lambda x: pct(x, 0, True), "roe": lambda x: pct(x, 0),
+         "peg": lambda x: "—" if pd.isna(x) else f"{x:.2f}".replace(".", ","), "lynch": lambda x: "—" if pd.isna(x) else f"{x:.2f}".replace(".", ",")}),
+        hide_index=True, column_config={"nom": "Ligne", "type_valo": "Type", "per": "PER", "croissance": "Croissance", "peg": "PEG", "lynch": "Lynch",
+                                        "roe": "ROE", "diagnostic": "Diagnostic"})
+
+
+# ================================================================== RAPPORT
+def page_rapport():
+    st.html("""<style>@media print { [data-testid="stSidebar"], header, [data-testid="stToolbar"] {display:none !important;}
+    .block-container {padding-top: 0 !important; max-width: 100% !important;} }</style>""")
+    st.subheader(f"Rapport au {dt.datetime.now(TZ):%d/%m/%Y}")
+    intro("Une page qui résume le portefeuille, pensée pour le jury ou pour ton bilan du mois. Pour l'enregistrer en PDF : "
+          "<b>Ctrl + P</b> › « Enregistrer au format PDF » (le menu de gauche disparaît à l'impression).")
+    sp = serie_portefeuille()
+    c = st.columns(4)
+    kpi(c[0], "Performance depuis le départ", pct(perf, 2, True), eur(total - apports))
+    if sp:
+        dd = (sp["indice"] / sp["indice"].cummax() - 1).min()
+        kpi(c[1], "Plus forte baisse", pct(dd, 1), "depuis un sommet", delta_color="off")
+        jours_ = sp["jours"]
+        bs = close_eur[BENCH_PRINCIPAL].reindex(jours_).ffill() if BENCH_PRINCIPAL in close_eur else None
+        if bs is not None and len(bs.dropna()):
+            kpi(c[2], "Euronext 100 sur la période", pct(bs.iloc[-1] / bs.dropna().iloc[0] - 1, 2, True), f"depuis le {jours_[0]:%d/%m}", delta_color="off")
+    n_ko = int((regles_lignes["ecarts"] > 0).sum())
+    kpi(c[3], "Lignes conformes à toutes les règles", f"{len(regles_lignes) - n_ko} / {len(regles_lignes)}", delta_color="off")
+    g, d = st.columns([3, 2])
+    with g:
+        if sp:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=sp["indice"].index, y=sp["indice"] - 1, name="Portefeuille", line=dict(width=2.5)))
+            for bt, bn in BENCH.items():
+                if bt in close_eur:
+                    b_ = close_eur[bt].reindex(sp["jours"]).ffill()
+                    fig.add_trace(go.Scatter(x=b_.index, y=b_ / b_.dropna().iloc[0] - 1, name=bn, line=dict(width=1.5, dash="dot")))
+            fig.update_layout(height=320, yaxis_tickformat="+.1%", margin=dict(t=30, l=0, r=0, b=0), legend=dict(orientation="h", y=-0.15),
+                              title=dict(text="Performance face aux indices", font_size=13))
+            graphe(fig, key="rap_perf")
+    with d:
+        st.markdown("**Risque**")
+        if risque:
+            c2 = st.columns(2)
+            kpi(c2[0], "Volatilité prévue", pct(risque["vol"]), f"bêta {risque['beta']:.2f}".replace(".", ","), delta_color="off")
+            kpi(c2[1], "Paris indépendants", f"{risque['dr'] ** 2:.1f}".replace(".", ","), f"ratio de diversification {risque['dr']:.2f}".replace(".", ","), delta_color="off")
+        st.markdown("**Contraintes**")
+        jauges(cons)
+    g, d = st.columns(2)
+    with g:
+        sec = poids.groupby(pf["secteur"].fillna("?")).sum().sort_values()
+        fig = go.Figure(go.Bar(x=sec.values, y=sec.index, orientation="h", marker_color=PALETTE[0], text=[pct(v) for v in sec.values], textposition="outside"))
+        fig.add_vline(x=LIM["secteur"], line_dash="dash", line_color=C_MAUVAIS, annotation_text="limite")
+        fig.update_layout(height=320, xaxis_tickformat=".0%", margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Répartition par secteur", font_size=13))
+        graphe(fig, key="rap_sect")
+    with d:
+        pc = pf.groupby(pf["poche"].fillna("Sans poche"))["poids"].sum().sort_values()
+        fig = go.Figure(go.Bar(x=pc.values, y=pc.index, orientation="h", marker_color=PALETTE[5], text=[pct(v) for v in pc.values], textposition="outside"))
+        fig.update_layout(height=320, xaxis_tickformat=".0%", margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Répartition par poche (thèse)", font_size=13))
+        graphe(fig, key="rap_poche")
+    st.markdown("### Les points à retenir")
+    pts = []
+    mx = pf["latent"].idxmax() if pf["latent"].notna().any() else None
+    mn = pf["latent"].idxmin() if pf["latent"].notna().any() else None
+    if mx is not None:
+        pts.append(f"Meilleure contribution : **{pf.loc[mx, 'nom']}** ({eur(pf.loc[mx, 'latent'])}) ; moins bonne : **{pf.loc[mn, 'nom']}** ({eur(pf.loc[mn, 'latent'])}).")
+    dep = cons[cons["etat"] != "Respectée"]
+    pts.append("Contraintes : " + ("toutes respectées." if dep.empty else ", ".join(f"{r['regle'].lower()} ({r['etat'].lower()}, {pct(r['niveau'])})" for _, r in dep.iterrows()) + "."))
+    if risque:
+        top_r = risque["contrib"].sort_values(ascending=False).head(3)
+        pts.append("Plus fortes contributions au risque : " + ", ".join(f"{pf['nom'].get(t, t)} ({pct(v)})" for t, v in top_r.items()) + ".")
+    if n_ko:
+        pts.append(f"{n_ko} lignes s'écartent d'au moins une règle d'entrée : voir la page Règles et le test de la page blanche.")
+    for p_ in pts:
+        st.markdown("- " + p_)
+    st.markdown("### Décisions des 30 derniers jours")
+    recents = tx[(tx["date"] >= pd.Timestamp.now() - pd.Timedelta(days=30)) & tx["type"].isin(["achat", "vente"])]
+    if recents.empty:
+        st.caption("Aucun ordre sur les 30 derniers jours.")
+    else:
+        rr_ = recents.assign(date=recents["date"].dt.strftime("%d/%m/%Y"), type=recents["type"].str.capitalize(), nom=[pf["nom"].get(t, lignes["nom"].get(t, t) if t in lignes.index else t) for t in recents["ticker"]])
+        tableau(rr_[["date", "nom", "type", "quantite", "prix"]].style.format({"quantite": "{:g}", "prix": lambda v: eur(v, 2)}), hide_index=True,
+                column_config={"date": "Date", "nom": "Ligne", "type": "Ordre", "quantite": "Quantité", "prix": "Prix"})
+    st.caption("Sources : NextWise (transactions), Yahoo Finance (cours différés), MarketScreener (fondamentaux), APTimum (scénarios). "
+               "Les chiffres officiels du concours restent ceux de NextWise.")
+
+
+# ================================================================== GUIDE
+GUIDE = {
+    "Ta routine": """
+- **Chaque jour, 2 minutes** : le *Tableau de bord*. Regarde les alertes rouges et les contraintes, puis la carte des lignes.
+- **Avant chaque achat** : *Candidats* pour trouver, *Valorisation* et MarketScreener pour vérifier, *Simulateur* pour tester, puis écris la thèse, la menace et la condition de sortie dans lignes.csv.
+- **Le 1er de chaque mois** : *Rééquilibrage* (ordres et test de la page blanche), *Règles*, *Risque*, *Stress tests*, puis *Chance ou talent* sur le mois écoulé. Note trois chiffres : ton percentile à risque égal, ton ratio de diversification, ta plus forte baisse. Termine par le *Rapport*, à enregistrer en PDF.
+- **Après chaque ordre** : ajoute la ligne dans transactions.csv (date AAAA-MM-JJ, point décimal, prix en euros = montant NextWise ÷ quantité).
+""",
+    "Tableau de bord": """
+- **Bandeau** : valeur totale et variation du jour, gain du jour face à l'Euronext 100, performance depuis le départ (même calcul que NextWise), cash, volatilité prévue, bêta, ratio de diversification.
+- **Carte** : taille = poids, couleur = variation du jour, regroupée par poche. Toute une poche de la même couleur = mouvement de thème, pas d'entreprise.
+- **Alertes** : rouge = une règle est touchée, orange = à surveiller. Une alerte n'est pas un ordre : c'est le signal de relire la fiche de la ligne.
+- **Contraintes** : UCITS 5/10/40, secteur ≤ 20 %, place ≤ 30 %. « Proche » = moins de 2 à 3 points de marge.
+""",
+    "Lignes et journal": """
+- **Prix de revient** : prix d'achat moyen. Il est affiché pour information : il n'entre dans aucune décision (effet de disposition).
+- **Momentum 12-1** : sous −20 %, c'est une règle de sortie. **Vol EWMA** : au-dessus de 40 %, poids réduit à 2,5 %.
+- **Part du risque** : à comparer au poids. Une ligne qui porte bien plus de risque que de capital concentre le danger.
+- **Journal** : PGR − PLR au-dessus de 5 points = tu vends tes gagnants trop tôt. **Prévisions** : le score de Brier mesure ton jugement, pas ta chance.
+""",
+    "Candidats, simulateur, rééquilibrage, règles": """
+- **Candidats** : d'abord « aucun écart aux règles », puis Δ diversification positif et Δ volatilité négatif, puis le meilleur score de momentum. Le mode « remplacement » répond à « par quoi remplacer Bureau Veritas ? ».
+- **Simulateur** : modifie les poids, mets 0 pour une vente. Si l'ordre fait dépasser une contrainte ou baisser la diversification sans raison, ne le passe pas.
+- **Rééquilibrage** : la bande de tolérance évite de trader pour quelques euros. Copie les lignes proposées dans le journal après exécution, avec les vrais prix.
+- **Règles** : ✓ / ✗ par ligne. Une ligne détenue qui perd une règle d'entrée se réexamine au rééquilibrage, elle ne se vend pas dans la minute.
+""",
+    "Risque, stress, régime, optimisation": """
+- **Volatilité prévue** : un an de cours. **Ratio de diversification** : plus il est haut, mieux tes lignes se compensent ; son carré = nombre de paris indépendants.
+- **VaR 95 %** : un jour sur vingt, tu perds plus que ça. **ES** : la perte moyenne ces jours-là.
+- **Facteurs** : bêta significatif = pari sur ce facteur. R² faible = beaucoup de sélection propre.
+- **Stress tests** : crises rejouées sur les vrais cours, scénarios APTimum, curseurs. Les curseurs sous-estiment les vraies crises (les corrélations montent).
+- **Régime** : turbulence au-dessus du 95e centile ou ratio d'absorption en forte hausse = marché fragile ; vérifie ton cash et tes stress tests.
+- **Optimisation** : compare ta pondération à la variance minimale, à la diversification maximale et à la parité de risque, sans prévision de rendement.
+""",
+    "Performance, momentum, valorisation, chance ou talent": """
+- **Performance** : courbe pondérée par le temps (les apports ne comptent pas comme gain). **Brinson** : allocation = bons secteurs ; sélection = bons titres dans le secteur ; la ligne « Cash » mesure le coût de ne pas être investi.
+- **Momentum** : le score combine momentum résiduel, 12-7, régularité et plus haut 52 semaines. Orange sur « dernier mois » = risque d'inversion. L'IC dit si le signal marche sur ton univers.
+- **Valorisation** : au-dessus de la droite PEG 2, la croissance ne justifie plus le prix. Cas 1, 2, 3 = du plus défendable au plus exigeant.
+- **Chance ou talent** : suit ton TFE. Monte Carlo (percentile à risque égal), bootstrap (p-valeur sans loi normale), jumeaux (bats-tu des titres qui te ressemblent ?), FDR (part de talent parmi tous les participants). Une période ne prouve rien : c'est la répétition qui compte.
+""",
+    "Rapport": """
+- Une page de synthèse pour le jury ou ton bilan mensuel : performance face aux indices, risque, contraintes, répartition, points à retenir, ordres du mois.
+- **Ctrl + P › Enregistrer au format PDF** pour en faire un document (le menu disparaît à l'impression).
+""",
+    "Données et limites": """
+- **Cours** : Yahoo Finance, différés d'environ 15 minutes, convertis en euros. La référence du concours reste NextWise.
+- **Onglet Données** : « saut suspect » = vérifie sur NextWise ; « cours ancien » = ticker à vérifier.
+- **Fondamentaux** : lignes.csv (MarketScreener) pour tes lignes, Yahoo (indicatif) pour les candidats.
+- **Affichage** : si un élément ne charge pas, le site se répare seul en quelques secondes et revient sur la même page.
+""",
+}
+
+
+def page_guide():
+    st.subheader("Guide")
+    intro("Comment lire chaque page, et la routine qui va avec. Toutes les références citées sur le site sont des articles publiés ; les noms et années "
+          "te permettent de les retrouver sur Google Scholar.")
+    for titre, texte in GUIDE.items():
+        with st.expander(titre, expanded=(titre == "Ta routine")):
+            st.markdown(texte)
+
+
+# ================================================================== NAVIGATION
+NAV = {
+    "Suivi": [
+        st.Page(page_direct, title="Tableau de bord", icon=":material/dashboard:", default=True),
+        st.Page(page_lignes, title="Lignes", icon=":material/list_alt:", url_path="lignes"),
+        st.Page(page_journal, title="Journal", icon=":material/receipt_long:", url_path="journal"),
+    ],
+    "Décider": [
+        st.Page(page_candidats, title="Candidats", icon=":material/travel_explore:", url_path="candidats"),
+        st.Page(page_simulateur, title="Simulateur", icon=":material/science:", url_path="simulateur"),
+        st.Page(page_reequilibrage, title="Rééquilibrage", icon=":material/balance:", url_path="reequilibrage"),
+        st.Page(page_regles, title="Règles", icon=":material/gavel:", url_path="regles"),
+    ],
+    "Risque": [
+        st.Page(page_risque, title="Risque", icon=":material/shield:", url_path="risque"),
+        st.Page(page_stress, title="Stress tests", icon=":material/thunderstorm:", url_path="stress-tests"),
+        st.Page(page_regime, title="Régime de marché", icon=":material/waves:", url_path="regime"),
+        st.Page(page_optimisation, title="Optimisation", icon=":material/tune:", url_path="optimisation"),
+    ],
+    "Analyse": [
+        st.Page(page_performance, title="Performance", icon=":material/trending_up:", url_path="performance"),
+        st.Page(page_momentum, title="Momentum", icon=":material/speed:", url_path="momentum"),
+        st.Page(page_valorisation, title="Valorisation", icon=":material/sell:", url_path="valorisation"),
+        st.Page(page_chance, title="Chance ou talent", icon=":material/casino:", url_path="chance-ou-talent"),
+    ],
+    "Outils": [
+        st.Page(page_rapport, title="Rapport", icon=":material/summarize:", url_path="rapport"),
+        st.Page(page_donnees, title="Données", icon=":material/database:", url_path="donnees"),
+        st.Page(page_guide, title="Guide", icon=":material/menu_book:", url_path="guide"),
+    ],
+}
+pg = st.navigation(NAV, expanded=True)
+st.session_state["page"] = pg.title
+bandeau()
+pg.run()

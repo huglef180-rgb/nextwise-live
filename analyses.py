@@ -328,3 +328,219 @@ def nombre_effectif_paris(poids, R):
     dr = float((w * np.sqrt(np.diag(cov))).sum() / np.sqrt(var))
     val = np.clip(np.linalg.eigvalsh(cov), 0, None)
     return {"enb": dr ** 2, "dr": dr, "n_lignes": len(t), "part_premier_facteur": float(val.max() / val.sum())}
+
+
+# ======================================================================= facteurs
+def regression_multi(y, X):
+    """MCO y = a + X b + e avec plusieurs facteurs. Retourne alpha, bêtas, t, R² et résidus."""
+    z = pd.concat([pd.Series(y, name="__y"), X], axis=1).dropna()
+    if len(z) < X.shape[1] + 15:
+        return None
+    yv = z["__y"].values
+    Xv = np.column_stack([np.ones(len(z)), z[X.columns].values])
+    coef, *_ = np.linalg.lstsq(Xv, yv, rcond=None)
+    res = yv - Xv @ coef
+    n, k = Xv.shape
+    s2 = res @ res / (n - k)
+    cov = s2 * np.linalg.pinv(Xv.T @ Xv)
+    t = coef / np.sqrt(np.clip(np.diag(cov), 1e-30, None))
+    r2 = 1 - (res @ res) / ((yv - yv.mean()) @ (yv - yv.mean())) if yv.var() > 0 else np.nan
+    return {"alpha": coef[0], "t_alpha": t[0], "betas": pd.Series(coef[1:], index=X.columns),
+            "t": pd.Series(t[1:], index=X.columns), "r2": r2, "n": n, "residus": pd.Series(res, index=z.index),
+            "X": z[X.columns]}
+
+
+def decomposition_variance(reg):
+    """Part de la variance du portefeuille expliquée par chaque facteur (b_i × (F b)_i) et part propre (résidus)."""
+    F = reg["X"].cov().values
+    b = reg["betas"].values
+    contrib = b * (F @ b)
+    var_res = reg["residus"].var()
+    tot = contrib.sum() + var_res
+    out = pd.Series(np.append(contrib, var_res) / tot, index=list(reg["betas"].index) + ["Propre aux titres"])
+    return out
+
+
+def facteur_basse_vol(prix):
+    """Facteur « basse volatilité » maison (dans l'esprit de Frazzini et Pedersen, Betting Against Beta, 2014) :
+    chaque mois, achat du tiers le moins volatil sur un an, vente du tiers le plus volatil, à poids égaux."""
+    rq = rendements(prix)
+    fins = prix.resample("ME").last().index
+    serie = []
+    for d0, d1 in zip(fins[:-1], fins[1:]):
+        h = rq.loc[:d0].iloc[-252:]
+        if len(h) < 200:
+            continue
+        v = h.std().dropna()
+        v = v[h.count() > 150]
+        if len(v) < 6:
+            continue
+        q = v.quantile([1 / 3, 2 / 3])
+        bas, haut = v[v <= q.iloc[0]].index, v[v >= q.iloc[1]].index
+        fen = rq.loc[(rq.index > d0) & (rq.index <= d1)]
+        serie.append(fen[bas].mean(axis=1) - fen[haut].mean(axis=1))
+    return pd.concat(serie).dropna() if serie else pd.Series(dtype=float)
+
+
+def lire_french(texte):
+    """Lit un fichier CSV de la bibliothèque de Kenneth French (données quotidiennes) : lignes de titre, une ligne
+    d'en-tête qui commence par une virgule, puis des lignes AAAAMMJJ,valeurs en %. S'arrête à la fin du bloc."""
+    lignes = texte.replace("\r", "").split("\n")
+    entete, data, dedans = None, [], False
+    for l in lignes:
+        if not dedans:
+            if l.startswith(",") and any(c.isalpha() for c in l):
+                entete = [c.strip() for c in l.split(",")[1:]]
+                dedans = True
+            continue
+        p = [c.strip() for c in l.split(",")]
+        if len(p) < 2 or not (p[0].isdigit() and len(p[0]) == 8):
+            if data:
+                break
+            continue
+        try:
+            data.append([pd.Timestamp(p[0])] + [float(x) / 100 for x in p[1:len(entete) + 1]])
+        except ValueError:
+            break
+    if not entete or not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data, columns=["date"] + entete).set_index("date")
+    return df
+
+
+def brinson(table):
+    """Attribution de Brinson-Fachler par secteur. table : index secteur, colonnes w_p, r_p, w_b, r_b.
+    Allocation : avoir sur- ou sous-pondéré les bons secteurs. Sélection : avoir choisi de meilleurs titres dans le secteur."""
+    t = table.copy()
+    t["r_p"] = t["r_p"].where(t["w_p"] > 0, t["r_b"])
+    Rb = (t["w_b"] * t["r_b"]).sum()
+    t["allocation"] = (t["w_p"] - t["w_b"]) * (t["r_b"] - Rb)
+    t["selection"] = t["w_b"] * (t["r_p"] - t["r_b"])
+    t["interaction"] = (t["w_p"] - t["w_b"]) * (t["r_p"] - t["r_b"])
+    t["total"] = t["allocation"] + t["selection"] + t["interaction"]
+    return t, Rb
+
+
+def sensibilites(R, facteurs):
+    """Bêtas de chaque titre à plusieurs facteurs (régression quotidienne)."""
+    out = {}
+    for c in R.columns:
+        reg = regression_multi(R[c], facteurs)
+        if reg is not None:
+            out[c] = reg["betas"]
+    return pd.DataFrame(out).T
+
+
+# ======================================================================= optimisation
+def _contraintes_poids(n, borne):
+    from scipy.optimize import Bounds
+    return Bounds(np.zeros(n), np.full(n, borne)), [{"type": "eq", "fun": lambda w: w.sum() - 1}]
+
+
+def optimiser(cov, mode, borne=0.10):
+    """Portefeuilles fondés sur le risque seul (sans prévision de rendement, donc robustes) :
+    'minvar' variance minimale, 'mdp' diversification maximale (Choueifaty et Coignard, 2008),
+    'erc' parité de risque (Maillard, Roncalli et Teïletche, 2010)."""
+    from scipy.optimize import minimize
+    n = cov.shape[0]
+    sig = np.sqrt(np.diag(cov))
+    w0 = np.full(n, 1 / n)
+    bornes, cons = _contraintes_poids(n, max(borne, 1 / n + 1e-6))
+    if mode == "minvar":
+        f = lambda w: w @ cov @ w * 1e4
+    elif mode == "mdp":
+        f = lambda w: -(w @ sig) / np.sqrt(w @ cov @ w)
+    elif mode == "erc":
+        def f(w):
+            v = w @ cov @ w
+            rc = w * (cov @ w)
+            return ((rc - v / n) ** 2).sum() * 1e8
+    else:
+        return w0
+    r = minimize(f, w0, method="SLSQP", bounds=bornes, constraints=cons, options={"maxiter": 500, "ftol": 1e-12})
+    w = np.clip(r.x, 0, None)
+    return w / w.sum()
+
+
+def plafonner(w, borne, iterations=50):
+    """Ramène chaque poids sous la borne en redistribuant l'excédent sur les autres lignes, proportionnellement."""
+    w = w.copy()
+    for _ in range(iterations):
+        trop = w > borne + 1e-12
+        if not trop.any():
+            break
+        exces = (w[trop] - borne).sum()
+        w[trop] = borne
+        libres = ~trop & (w < borne)
+        if not libres.any():
+            break
+        w[libres] += exces * w[libres] / w[libres].sum()
+    return w
+
+
+def nuage_portefeuilles(cov, mu, n=4000, borne=0.10, graine=5):
+    """Portefeuilles aléatoires (poids de Dirichlet de concentration variable, plafonnés) : volatilité, rendement passé,
+    ratio de diversification, Sharpe."""
+    rng = np.random.default_rng(graine)
+    k = cov.shape[0]
+    borne = max(borne, 1.0 / k + 1e-6)
+    alphas = rng.uniform(0.3, 6.0, size=n)
+    W = np.vstack([plafonner(rng.dirichlet(np.full(k, a_)), borne) for a_ in alphas])
+    sig = np.sqrt(np.diag(cov))
+    vol = np.sqrt(np.einsum("ij,jk,ik->i", W, cov, W))
+    ret = W @ mu
+    return pd.DataFrame({"vol": vol, "rendement": ret, "dr": (W @ sig) / vol, "sharpe": ret / vol})
+
+
+# ======================================================================= signaux dans le temps
+def ic_mensuel(prix, n_mois=36):
+    """Coefficient d'information mensuel (corrélation de rang entre un signal et le rendement du mois suivant,
+    sur tout l'univers). Grinold et Kahn (2000) : un IC moyen de 0,05 est déjà un bon signal."""
+    fins = list(prix.resample("ME").last().index)
+    out = []
+    for d0, d1 in zip(fins[-n_mois - 1:-1], fins[-n_mois:]):
+        h = prix.loc[:d0]
+        if len(h) < 260:
+            continue
+        p0 = h.iloc[-1]
+        sig = pd.DataFrame({
+            "Momentum 12-1": h.iloc[-22] / h.iloc[-253] - 1,
+            "Momentum 12-7": h.iloc[-148] / h.iloc[-253] - 1,
+            "Plus haut 52 semaines": p0 / h.iloc[-252:].max(),
+            "Dernier mois (inversion)": -(p0 / h.iloc[-22] - 1),
+        })
+        p1 = prix.loc[:d1].iloc[-1]
+        fut = p1 / p0 - 1
+        ligne = {"mois": d1}
+        for c in sig.columns:
+            z = pd.concat([sig[c], fut], axis=1).dropna()
+            ligne[c] = stats.spearmanr(z.iloc[:, 0], z.iloc[:, 1])[0] if len(z) > 10 else np.nan
+        out.append(ligne)
+    return pd.DataFrame(out).set_index("mois") if out else pd.DataFrame()
+
+
+def scores_historiques(prix, bench, n_semaines=26):
+    """Score de momentum de chaque titre recalculé chaque semaine sur les n dernières semaines."""
+    dates = prix.index[::-5][:n_semaines][::-1]
+    out = {}
+    for d in dates:
+        sg = signaux_momentum(prix.loc[:d], bench.loc[:d])
+        out[d] = sg["score"]
+    return pd.DataFrame(out)
+
+
+# ======================================================================= prévisions
+def score_brier(df):
+    """Score de Brier (Brier, 1950) des prévisions résolues : moyenne de (probabilité − résultat)². 0 = parfait,
+    0,25 = toujours répondre 50 %. Avec la calibration par tranches de probabilité."""
+    d = df.dropna(subset=["probabilite", "resultat"]).copy()
+    if d.empty:
+        return None
+    p, o = d["probabilite"].astype(float), d["resultat"].astype(float)
+    bs = float(((p - o) ** 2).mean())
+    base = float(o.mean())
+    bs_ref = float(((base - o) ** 2).mean())
+    d["tranche"] = pd.cut(p, [0, 0.2, 0.4, 0.6, 0.8, 1.0], include_lowest=True)
+    cal = d.groupby("tranche", observed=True).agg(prevu=("probabilite", "mean"), realise=("resultat", "mean"), n=("resultat", "size"))
+    return {"brier": bs, "n": len(d), "taux_reussite": base, "brier_reference": bs_ref,
+            "skill": 1 - bs / bs_ref if bs_ref > 0 else np.nan, "calibration": cal}
