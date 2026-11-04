@@ -1,0 +1,17 @@
+groupe,scenario,portefeuille,reference
+APTimum,Crise asiatique 1997,-0.0549,-0.087
+APTimum,Défaut russe 1998,-0.1324,-0.2186
+APTimum,11 septembre 2001,-0.0859,-0.173
+APTimum,WorldCom 2002,-0.1255,-0.208
+APTimum,Crise des subprimes 2007,-0.0403,-0.0569
+APTimum,Crise financière 2008,-0.2213,-0.2934
+APTimum,Crise des dettes souveraines 2010,-0.1073,-0.0759
+APTimum,Turbulences de 2016,-0.1052,-0.1811
+APTimum,Krach du Coronavirus 2020,-0.2066,-0.3205
+APTimum,Guerre et inflation 2022,-0.188,-0.2188
+APTimum,Actions nord-américaines −10 %,-0.02,-0.0511
+APTimum,Actions européennes −10 %,-0.0527,-0.0696
+APTimum,Krach de la tech américaine,-0.0601,-0.1548
+Choc hypothétique,Le marché baisse de 10 %,-0.08,-0.1
+Choc hypothétique,Le marché baisse de 20 %,-0.16,-0.2
+Choc hypothétique,Le marché baisse de 30 %,-0.241,-0.3

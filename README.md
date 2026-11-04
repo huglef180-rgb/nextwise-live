@@ -9,6 +9,9 @@ Cours Yahoo Finance différés d'environ 15 minutes, convertis en euros. Les chi
 - `transactions.csv` : le journal (une ligne par ordre exécuté)
 - `lignes.csv` : la fiche de chaque ligne (poche, secteur, place, thèse, menace, sortie)
 - `participants.csv` (facultatif) : l'export de la carte performance-risque d'APTimum, pour l'étape 3 de « Chance ou talent »
+- `aptimum.csv` : les scénarios du dernier rapport APTimum (à remplacer à chaque nouveau rapport)
+- `previsions.csv` : tes prévisions chiffrées, pour le score de Brier (page Journal)
+- `.streamlit/config.toml` (facultatif) : le thème de couleurs
 - `univers.csv` : les titres utilisés pour tirer les portefeuilles aléatoires (onglet « Chance ou talent »)
 - `requirements.txt` : les bibliothèques
 
@@ -22,6 +25,9 @@ Tickers au format Yahoo : `KBC.BR`, `AI.PA`, `RACE.MI`, `KPN.AS`, `EDP.LS`, `RYA
 3. Partager › Tous les utilisateurs disposant du lien › Lecteur.
 4. Copie l'identifiant du Sheet (la partie entre `/d/` et `/edit` dans l'adresse).
 5. Sur Streamlit Cloud : Settings › Secrets, colle `SHEET_ID = "ton_identifiant"`.
+
+## Vérifier les calculs
+`python verifier.py` : 17 tests sur des cas dont la réponse est connue (bootstrap, FDR, facteurs, Brinson, parité de risque…).
 
 ## Tester sans connexion
 `NEXTWISE_MOCK=1 streamlit run app.py` (cours simulés).
