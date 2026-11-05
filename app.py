@@ -131,7 +131,10 @@ def eur(x, d=0):
 def pct(x, d=1, signe=False):
     if x is None or pd.isna(x):
         return "—"
-    s = f"{x * 100:+.{d}f}" if signe else f"{x * 100:.{d}f}"
+    v = round(float(x) * 100, d)
+    if v == 0:   # évite « -0 % » et « +0 % » sur une valeur arrondie à zéro
+        return f"{0.0:.{d}f}".replace(".", ",") + " %"
+    s = f"{v:+.{d}f}" if signe else f"{v:.{d}f}"
     return s.replace(".", ",") + " %"
 
 
@@ -436,11 +439,14 @@ def contraintes(df):
 
 
 TABLE_CSS = """<style>
-.nwt {overflow-x:auto; margin-bottom:0.5rem}
-.nwt table {border-collapse:collapse; font-size:0.86rem; width:100%; font-variant-numeric:tabular-nums}
-.nwt th {text-align:left; padding:6px 10px; border-bottom:1px solid rgba(128,128,128,.45); white-space:nowrap; font-weight:600}
-.nwt td {padding:5px 10px; border-bottom:1px solid rgba(128,128,128,.18); white-space:nowrap}
-.nwt tbody tr:hover td, .nwt tbody tr:hover th {background:rgba(128,128,128,.10)}
+.nwt {overflow-x:auto; margin:4px 0 0.8rem; border:1px solid rgba(128,128,128,.20); border-radius:12px}
+.nwt table {border-collapse:collapse; font-size:0.85rem; width:100%; font-variant-numeric:tabular-nums}
+.nwt thead th {text-align:left; padding:9px 10px; background:rgba(128,128,128,.07); border-bottom:1px solid rgba(128,128,128,.25);
+  white-space:nowrap; font-weight:600; font-size:.7rem; text-transform:uppercase; letter-spacing:.03em; opacity:.85}
+.nwt td {padding:7px 10px; border-bottom:1px solid rgba(128,128,128,.12); white-space:nowrap}
+.nwt tbody tr:last-child td {border-bottom:none}
+.nwt tbody tr:hover td {background:rgba(79,139,255,.07)}
+.nwt td:first-child {font-weight:500}
 </style>"""
 
 
@@ -454,6 +460,10 @@ def tableau(data, column_config=None, hide_index=None, height=None, **_):
         noms.append(lab if isinstance(lab, str) else str(c))
     sty = sty.relabel_index(noms, axis="columns")
     sty = sty.hide(axis="index")   # l'index n'est jamais affiché : une colonne qui compte doit être une vraie colonne
+    # chiffres alignés à droite (colonnes numériques, en-tête compris), comme dans un tableur
+    num = [i for i, c in enumerate(sty.data.columns) if pd.api.types.is_numeric_dtype(sty.data[c]) and not pd.api.types.is_bool_dtype(sty.data[c])]
+    if num:
+        sty = sty.set_table_styles([{"selector": f"th.col{i}, td.col{i}", "props": "text-align:right"} for i in num], overwrite=False)
     st.html(TABLE_CSS + '<div class="nwt">' + sty.to_html() + "</div>")
 
 
@@ -624,6 +634,125 @@ def charger_calendrier(tickers):
     return out
 
 
+FICHIER_RES = "/tmp/nextwise_resultats.json"
+
+
+def _ligne_compta(df, noms):
+    """Valeurs d'un poste comptable Yahoo, de l'exercice le plus récent au plus ancien."""
+    if df is None or getattr(df, "empty", True):
+        return []
+    for n in noms:
+        if n in df.index:
+            v = pd.to_numeric(df.loc[n], errors="coerce")
+            v.index = pd.to_datetime(v.index, errors="coerce")
+            return v.dropna().sort_index(ascending=False).tolist()
+    return []
+
+
+def _ligne_periode(df, periodes=("0y", "+1y")):
+    if df is None or getattr(df, "empty", True):
+        return None
+    for per in periodes:
+        if per in df.index:
+            return {str(k).lower(): v for k, v in df.loc[per].items()}
+    return None
+
+
+def _resultats_un(t, secteur=None):
+    """Surprise de résultats, révisions des analystes et comptes annuels d'un titre. Chaque bloc est indépendant :
+    une donnée absente chez Yahoo laisse un trou au lieu de tout bloquer."""
+    vide = {"gp_a": np.nan, "croiss_actif": np.nan, "emission": np.nan, "surprise": np.nan, "date_pub": None,
+            "n_pos4": np.nan, "n_4": np.nan, "rev30": np.nan, "rev90": np.nan, "net_rev30": np.nan}
+    d = dict(vide)
+    if MOCK or yf is None:
+        import zlib
+        g = np.random.default_rng(zlib.crc32(t.encode()))
+        fin = isinstance(secteur, str) and secteur.lower().startswith("financ")
+        d.update({"gp_a": np.nan if fin else g.uniform(0.05, 0.55), "croiss_actif": g.normal(0.06, 0.08), "emission": g.normal(0.0, 0.02),
+                  "surprise": g.normal(0.01, 0.07), "date_pub": (pd.Timestamp.now() - pd.Timedelta(days=int(g.integers(3, 120)))).strftime("%Y-%m-%d"),
+                  "n_pos4": int(g.integers(0, 5)), "n_4": 4, "rev30": g.normal(0, 0.03), "rev90": g.normal(0, 0.06), "net_rev30": int(g.integers(-4, 5))})
+        if os.environ.get("NEXTWISE_DEGRADE") == "1":
+            for k in list(d):
+                if g.random() < 0.35:
+                    d[k] = None if k == "date_pub" else np.nan
+        return d
+    tk = yf.Ticker(t)
+    try:
+        inc, bal = tk.income_stmt, tk.balance_sheet
+        gp = _ligne_compta(inc, ["Gross Profit"])
+        ta = _ligne_compta(bal, ["Total Assets"])
+        sh = _ligne_compta(bal, ["Ordinary Shares Number", "Share Issued"])
+        d["gp_a"] = A.rentabilite_brute(gp[0], ta[0]) if gp and ta else np.nan
+        d["croiss_actif"] = A.variation_annuelle(ta[0], ta[1]) if len(ta) > 1 else np.nan
+        d["emission"] = A.variation_annuelle(sh[0], sh[1]) if len(sh) > 1 else np.nan
+    except Exception as e:
+        log(f"comptes {t} : {type(e).__name__}")
+    try:
+        ed = tk.get_earnings_dates(limit=12)
+        if ed is not None and not ed.empty:
+            ed = ed.copy()
+            idx = pd.DatetimeIndex(pd.to_datetime(ed.index, errors="coerce"))
+            ed.index = idx.tz_convert(None) if idx.tz is not None else idx
+            c_s = next((c for c in ed.columns if "surprise" in str(c).lower()), None)
+            c_r = next((c for c in ed.columns if "reported" in str(c).lower()), None)
+            if c_s and c_r:
+                passe = ed[pd.to_numeric(ed[c_r], errors="coerce").notna()].sort_index(ascending=False)
+                sur = pd.to_numeric(passe[c_s], errors="coerce")
+                if len(passe) and pd.notna(sur.iloc[0]):
+                    d["surprise"] = float(sur.iloc[0]) / 100
+                    d["date_pub"] = passe.index[0].strftime("%Y-%m-%d")
+                d["n_4"] = int(sur.iloc[:4].notna().sum())
+                d["n_pos4"] = int((sur.iloc[:4] > 0).sum())
+    except Exception as e:
+        log(f"surprises {t} : {type(e).__name__}")
+    try:
+        tr = _ligne_periode(tk.eps_trend)
+        if tr:
+            d["rev30"] = A.revision_prevision(tr.get("current"), tr.get("30daysago"))
+            d["rev90"] = A.revision_prevision(tr.get("current"), tr.get("90daysago"))
+    except Exception as e:
+        log(f"tendance BPA {t} : {type(e).__name__}")
+    try:
+        rv = _ligne_periode(tk.eps_revisions)
+        if rv:
+            up, dn = pd.to_numeric(rv.get("uplast30days"), errors="coerce"), pd.to_numeric(rv.get("downlast30days"), errors="coerce")
+            d["net_rev30"] = (0 if pd.isna(up) else up) - (0 if pd.isna(dn) else dn) if pd.notna(up) or pd.notna(dn) else np.nan
+    except Exception as e:
+        log(f"révisions {t} : {type(e).__name__}")
+    return d
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Résultats, révisions et comptes annuels (Yahoo, une à deux minutes la première fois)…")
+def donnees_resultats(tickers, secteurs=None):
+    import json
+    sect = dict(secteurs or ())
+    out = {t: _resultats_un(t, sect.get(t)) for t in tickers}
+    try:
+        ancien = {}
+        if os.path.exists(FICHIER_RES):
+            with open(FICHIER_RES) as f:
+                ancien = json.load(f).get("donnees", {})
+        ancien.update({t: {k: (None if (v is None or (isinstance(v, float) and np.isnan(v))) else v) for k, v in d.items()} for t, d in out.items()})
+        with open(FICHIER_RES, "w") as f:
+            json.dump({"maj": dt.datetime.now().isoformat(), "donnees": ancien}, f)
+    except Exception as e:
+        log(f"fichier résultats : {type(e).__name__}")
+    return pd.DataFrame(out).T
+
+
+def lire_resultats():
+    """Dernières données de résultats enregistrées sur le serveur (moins de 24 h), sans appel à Yahoo."""
+    import json
+    try:
+        with open(FICHIER_RES) as f:
+            j = json.load(f)
+        if (dt.datetime.now() - dt.datetime.fromisoformat(j["maj"])).total_seconds() < 24 * 3600:
+            return pd.DataFrame(j["donnees"]).T, j["maj"]
+    except Exception:
+        pass
+    return pd.DataFrame(), None
+
+
 def lire_calendrier():
     import json
     try:
@@ -708,8 +837,8 @@ with st.sidebar:
         st.warning("Mode test : cours simulés.")
     st.checkbox("Actualiser chaque minute (tableau de bord)", value=True, key="auto")
     actualisation_auto()
-    st.number_input("Taux sans risque (%)", 0.0, 10.0, 2.0, 0.25, key="rf",
-                    help="Taux de la facilité de dépôt de la BCE, utilisé pour les ratios de Sharpe, Sortino, Treynor et M². Vérifie-le sur le site de la BCE.")
+    st.number_input("Taux sans risque (%)", 0.0, 10.0, 2.5, 0.25, key="rf",
+                    help="Taux de la facilité de dépôt de la BCE (2,50 % depuis septembre 2026), utilisé pour les ratios de Sharpe, Sortino, Treynor et M². Vérifie-le sur le site de la BCE.")
     if st.button("Rafraîchir les cours maintenant"):
         intraday.clear()
         charger_tables.clear()
@@ -862,6 +991,20 @@ if cal_dates:
             jj = (pd.Timestamp(d) - auj_).days
             if 0 <= jj <= 3:
                 alertes.append(("warn", f"{pf.loc[t, 'nom']} publie ses résultats {'aujourd’hui' if jj == 0 else f'dans {jj} jour' + ('s' if jj > 1 else '')} ({pd.Timestamp(d):%d/%m}) : relis sa condition de sortie avant."))
+res_alerte, _ = lire_resultats()
+if not res_alerte.empty:
+    auj_r = pd.Timestamp.now(tz=TZ).normalize().tz_localize(None)
+    for t in pf.index:
+        if t not in res_alerte.index:
+            continue
+        rr_ = res_alerte.loc[t]
+        sg, jj = A.signal_pead(pd.to_numeric(rr_.get("surprise"), errors="coerce"), rr_.get("date_pub"), auj_r)
+        if sg == -1:
+            alertes.append(("warn", f"{pf.loc[t, 'nom']} : résultats {pct(abs(float(rr_['surprise'])), 0)} sous le consensus il y a {jj} jours. "
+                                    "La dérive post-annonce joue contre la ligne pendant environ trois mois."))
+        r90 = pd.to_numeric(rr_.get("rev90"), errors="coerce")
+        if pd.notna(r90) and r90 < -0.05:
+            alertes.append(("warn", f"{pf.loc[t, 'nom']} : prévisions de bénéfice abaissées de {pct(-r90, 0)} en 90 jours par les analystes."))
 for t, rg in regles_lignes.iterrows():
     if rg["ligne_risquee"] == "✗":
         alertes.append(("warn", f"{rg['nom']} : ligne risquée qui ne remplit pas la règle ({rg['detail_risquee']})."))
@@ -915,7 +1058,21 @@ h3 {font-weight: 600 !important; margin-top: 0.6rem !important;}
 .nw-j .bar span {position:absolute; left:0; top:0; bottom:0; border-radius:6px;}
 .nw-j .ok span {background:#22c55e;} .nw-j .pr span {background:#f59e0b;} .nw-j .ko span {background:#ef4444;}
 .nw-k.solo {margin-bottom:10px;} .nw-k.solo .v {font-size:1.25rem;}
-.nw-intro {font-size:.9rem; opacity:.8; margin:-4px 0 12px; max-width: 1100px;}
+.nw-intro {font-size:.9rem; opacity:.8; margin:-4px 0 12px; max-width: 1100px; line-height:1.5;}
+.nw-k {transition: border-color .15s;} .nw-k:hover {border-color: rgba(79,139,255,.45);}
+.nw-band .nw-k:first-child {border-color: rgba(79,139,255,.40); background: rgba(79,139,255,.06);}
+.nw-al {display:flex; flex-direction:column; gap:6px; margin:2px 0 12px;}
+.nw-al .a {display:flex; gap:10px; align-items:flex-start; padding:8px 12px; border-radius:10px; font-size:.86rem; line-height:1.4;
+  background:rgba(127,127,127,.05); border:1px solid rgba(127,127,127,.15);}
+.nw-al .a.bad {border-left:3px solid #ef4444;} .nw-al .a.warn {border-left:3px solid #f59e0b;}
+.nw-al .tag {flex:none; font-size:.66rem; font-weight:700; text-transform:uppercase; letter-spacing:.06em; padding:2px 7px; border-radius:6px; margin-top:1px;}
+.nw-al .bad .tag {background:rgba(239,68,68,.14); color:#dc2626;} .nw-al .warn .tag {background:rgba(245,158,11,.16); color:#b45309;}
+.nw-al .ok {border-left:3px solid #22c55e;}
+[data-testid="stNavSectionHeader"] {font-size:.68rem !important; text-transform:uppercase; letter-spacing:.09em; opacity:.6; font-weight:650 !important; margin-top:.4rem;}
+[data-testid="stSidebarNavLink"] {border-radius:8px;}
+[data-testid="stMainBlockContainer"] h3 {padding-top:.2rem;}
+[data-testid="stExpander"] details {border-radius:12px;}
+div[data-testid="stAlert"] {border-radius:12px;}
 </style>"""
 
 
@@ -993,11 +1150,24 @@ def kpi(conteneur, titre, valeur, sous=None, delta_color="normal", **_):
 
 
 def RF():
-    return float(st.session_state.get("rf", 2.0)) / 100
+    return float(st.session_state.get("rf", 2.5)) / 100
 
 
 def intro(texte):
     st.html(f'<div class="nw-intro">{texte}</div>')
+
+
+def liste_alertes(liste, maxi=6):
+    """Alertes en liste compacte : rouge = règle touchée, orange = à surveiller. Les suivantes sont repliées."""
+    if not liste:
+        st.html(CSS_GLOBAL + '<div class="nw-al"><div class="a ok">Rien à signaler.</div></div>')
+        return
+    tri = sorted(liste, key=lambda a: a[0] != "bad")
+    ligne = lambda n, t: f'<div class="a {n}"><span class="tag">{"Alerte" if n == "bad" else "À voir"}</span><span>{html.escape(t)}</span></div>'
+    st.html(CSS_GLOBAL + '<div class="nw-al">' + "".join(ligne(n, t) for n, t in tri[:maxi]) + "</div>")
+    if len(tri) > maxi:
+        with st.expander(f"{len(tri) - maxi} autre{'s' if len(tri) - maxi > 1 else ''}"):
+            st.html(CSS_GLOBAL + '<div class="nw-al">' + "".join(ligne(n, t) for n, t in tri[maxi:]) + "</div>")
 
 
 def serie_portefeuille():
@@ -1062,10 +1232,7 @@ def page_direct():
         graphe(fig, key="carte", theme=None)
     with d:
         st.subheader("Alertes")
-        if not alertes:
-            st.success("Rien à signaler.")
-        for niveau, texte in sorted(alertes, key=lambda a: a[0] != "bad")[:12]:
-            (st.error if niveau == "bad" else st.warning)(texte)
+        liste_alertes(alertes)
         st.subheader("Contraintes")
         jauges(cons)
 
@@ -1138,6 +1305,16 @@ def page_lignes():
         kpi(m1, "Poids", pct(r["poids"]), f"cible {pct(r['poids_cible'])}" if pd.notna(r["poids_cible"]) else None)
         kpi(m2, "Latent", pct(r["latent_pct"], 1, True), eur(r["latent"]))
         kpi(m3, "Momentum 12-1", pct(r.get("momentum"), 0, True))
+        res_l, _ = lire_resultats()
+        if not res_l.empty and sel in res_l.index:
+            q = res_l.loc[sel]
+            num = lambda k: pd.to_numeric(q.get(k), errors="coerce")
+            sg, jj = A.signal_pead(num("surprise"), q.get("date_pub"), pd.Timestamp.now(tz=TZ).normalize().tz_localize(None))
+            n1, n2, n3 = st.columns(3)
+            kpi(n1, "Dernière surprise", pct(num("surprise"), 1, True) if pd.notna(num("surprise")) else "—", _derive_txt(sg, jj))
+            kpi(n2, "Révision BPA 90 j", pct(num("rev90"), 1, True) if pd.notna(num("rev90")) else "—")
+            kpi(n3, "Rentabilité brute", pct(num("gp_a"), 0) if pd.notna(num("gp_a")) else "—",
+                f"actif {pct(num('croiss_actif'), 0, True)} sur un an" if pd.notna(num("croiss_actif")) else None, delta_color="inverse")
         for titre, champ in [("Thèse", "these"), ("Menace", "menace"), ("Je sors si", "sortie"), ("Prochain événement", "evenement"), ("Moat", "moat"), ("Valorisation", "diagnostic"), ("Décision écrite", "verdict")]:
             v = r[champ]
             st.markdown(f"**{titre}** : {v if isinstance(v, str) and v.strip() else '*à compléter*'}")
@@ -1189,7 +1366,7 @@ def page_performance():
         graphe(fig, key="dd")
 
     st.subheader("Ratios de risque et de rendement")
-    intro("Les indicateurs des logiciels de gestion (Morningstar Direct, Bloomberg PORT), pour ton portefeuille et pour l'Euronext 100, sur la même période. "
+    intro("Les indicateurs des logiciels de gestion (Morningstar Direct, Bloomberg PORT), pour ton portefeuille et pour la référence choisie, sur la même période. "
           f"Taux sans risque utilisé : {pct(RF(), 2)} (réglable dans le menu de gauche).")
     premier = tx.loc[tx["type"] == "achat", "date"].dropna()
     premier = premier.value_counts().idxmax() if len(premier) else None
@@ -1201,7 +1378,16 @@ def page_performance():
                      help="Le portefeuille réel est la vraie mesure, mais il faut quelques semaines d'historique. Le rejoué applique tes poids actuels "
                           "à l'année passée : il décrit ta stratégie, sans prouver de talent (biais de sélection).")
     r_ser = r_reel if choix == options[1] else portefeuille_rejoue(252)
-    r_ind = adj_eur[BENCH_PRINCIPAL].pct_change(fill_method=None) if BENCH_PRINCIPAL in adj_eur else None
+    refs = ["Euronext 100", "Ta liste de départ à poids égaux"]
+    ref = st.radio("Comparer à", refs, horizontal=True, key="ratios_ref",
+                   help="Un portefeuille à poids égaux bat souvent l'indice pondéré par la capitalisation, sans aucun talent de sélection "
+                        "(DeMiguel, Garlappi et Uppal, 2009). Battre aussi ta liste à poids égaux montre que l'avance vient du choix des titres, pas de la pondération.")
+    if ref == refs[1]:
+        pu_, _, _ = prix_univers(True)
+        r_ind = pu_.pct_change(fill_method=None).mean(axis=1, skipna=True) if not pu_.empty else None
+    else:
+        r_ind = adj_eur[BENCH_PRINCIPAL].pct_change(fill_method=None) if BENCH_PRINCIPAL in adj_eur else None
+    nom_ref = "Euronext 100" if ref == refs[0] else "Liste à poids égaux"
     rt = A.ratios(r_ser, r_ind, RF()) if r_ind is not None else None
     if not rt:
         st.info(f"Il faut au moins 20 séances pour ces ratios ({len(r_ser)} pour l'instant) : choisis « rejoué sur un an » en attendant.")
@@ -1238,7 +1424,7 @@ def page_performance():
         vue["indice_txt"] = [fmt(r_, "indice") for _, r_ in vue.iterrows()]
         tableau(vue[["ratio", "portefeuille_txt", "indice_txt", "verdict", "definition"]].style
                 .map(lambda v: f"color:{C_BON};font-weight:600" if v == "mieux" else (f"color:{C_MAUVAIS};font-weight:600" if v == "moins bien" else ""), subset=["verdict"]),
-                hide_index=True, column_config={"ratio": "Indicateur", "portefeuille_txt": "Portefeuille", "indice_txt": "Euronext 100", "verdict": "Face à l'indice",
+                hide_index=True, column_config={"ratio": "Indicateur", "portefeuille_txt": "Portefeuille", "indice_txt": nom_ref, "verdict": "Face à la référence",
                                                 "definition": "Ce que ça mesure"})
         st.caption(f"Calculé sur {n_j} séances. Sur moins de six mois, ces ratios sont très instables : lis-les comme des tendances, pas comme des verdicts.")
 
@@ -1483,8 +1669,15 @@ def bv_cache(prix):
 @st.cache_data(ttl=24 * 3600, show_spinner="Facteurs Fama-French Europe (Kenneth French)…")
 def french_europe():
     """Facteurs européens quotidiens de la bibliothèque de Kenneth French (Dartmouth). Vide si le téléchargement échoue."""
-    if MOCK:
-        return pd.DataFrame()
+    if MOCK:   # test hors ligne : facteurs simulés (publiés avec un mois de retard, comme les vrais) ; vides en mode dégradé
+        if os.environ.get("NEXTWISE_DEGRADE") == "1":
+            return pd.DataFrame()
+        fin = (pd.Timestamp.now(tz=TZ).normalize().tz_localize(None) - pd.offsets.MonthEnd(1))
+        idx = pd.bdate_range(end=fin, periods=1900)
+        rng = np.random.default_rng(11)
+        return pd.DataFrame({c: rng.normal(m, s, len(idx)) for c, m, s in [
+            ("Taille (SMB)", 0.0, 0.004), ("Value (HML)", 0.0001, 0.005), ("Rentabilité (RMW)", 0.0001, 0.003),
+            ("Investissement (CMA)", 0.0, 0.003), ("Momentum (WML)", 0.0003, 0.007)]}, index=idx)
     import io, urllib.request, zipfile
     base = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
     out = []
@@ -1622,9 +1815,13 @@ def page_momentum():
         wml_k = wml_cache(pu_k)
         if len(wml_k) > 60:
             kr_k = A.risque_krach_momentum(adj_eur[BENCH_PRINCIPAL], wml_k)
+            cum_k = (1 + wml_k).cumprod()
+            recul_k = float(cum_k.iloc[-1] / cum_k.max() - 1)
             st.markdown("### Faut-il se fier au momentum en ce moment ?")
-            c = st.columns(3)
+            c = st.columns(4)
             ech = kr_k["echelle_bsc"]
+            kpi(c[3], "Recul du facteur depuis son plus haut", pct(recul_k, 0, True),
+                f"plus haut le {cum_k.idxmax():%d/%m/%Y}" if recul_k < -0.005 else "au plus haut", delta_color="off")
             kpi(c[0], "Poids à donner au momentum", "—" if pd.isna(ech) else f"{ech:.1f}×".replace(".", ","),
                 "1 = normal · sous 1 = moins de poids (Barroso et Santa-Clara, 2015)", delta_color="off")
             kpi(c[1], "Volatilité du facteur momentum", pct(kr_k["vol_wml"], 0), "6 derniers mois · cible 12 %", delta_color="off")
@@ -1633,7 +1830,8 @@ def page_momentum():
             if kr_k["alerte"]:
                 st.error("Risque de krach du momentum : marché baissier sur 2 ans et volatilité forte. Ne t'appuie pas sur le momentum pour tes prochains choix.")
             elif pd.notna(ech) and ech < 0.8:
-                st.warning("Le momentum est agité en ce moment : donne-lui moins de poids que d'habitude. Ne vends pas une ligne uniquement pour un score de "
+                st.warning("Le momentum est agité en ce moment" + (f" (le facteur est à {pct(recul_k, 0, True)} de son plus haut)" if recul_k < -0.10 else "")
+                           + " : donne-lui moins de poids que d'habitude. Ne vends pas une ligne uniquement pour un score de "
                            "momentum faible, et ne cours pas après les titres qui viennent de flamber ; appuie-toi davantage sur la qualité, la valorisation et la diversification.")
             else:
                 st.success("Contexte normal : tu peux utiliser le momentum comme d'habitude dans tes choix.")
@@ -1645,15 +1843,26 @@ def page_momentum():
             if len(wml) > 60:
                 cumul = (1 + wml).cumprod() - 1
                 vol6 = wml.rolling(126).std() * np.sqrt(252)
+                ff_m = french_europe()
+                off = None
+                if ff_m is not None and not ff_m.empty and "Momentum (WML)" in ff_m:
+                    o = ff_m["Momentum (WML)"].dropna()
+                    o = o[o.index > wml.index.min()]
+                    if len(o) > 60:
+                        off = (1 + o).cumprod() - 1
                 g, d = st.columns(2)
                 with g:
-                    fig = go.Figure(go.Scatter(x=cumul.index, y=cumul, line=dict(width=2), name="Gagnants − perdants"))
+                    fig = go.Figure(go.Scatter(x=cumul.index, y=cumul, line=dict(width=2), name=f"Ta liste de départ ({pu.shape[1]} titres)"))
+                    if off is not None:
+                        fig.add_trace(go.Scatter(x=off.index, y=off, line=dict(width=2, dash="dot", color="#64748B"),
+                                                 name="Europe entière (Kenneth French)"))
                     fig.add_hline(y=0, line_color="#bbbbbb", line_width=1)
-                    fig.update_layout(height=280, yaxis_tickformat="+.0%", margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Rendement cumulé du facteur", font_size=13))
+                    fig.update_layout(height=300, yaxis_tickformat="+.0%", margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Rendement cumulé du facteur", font_size=13),
+                                      legend=dict(orientation="h", y=-0.15), hovermode="x unified")
                     graphe(fig, key="wml")
                 with d:
                     fig = go.Figure(go.Scatter(x=vol6.index, y=vol6, line=dict(width=2, color=C_ATTENTION)))
-                    fig.update_layout(height=280, yaxis_tickformat=".0%", margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Volatilité du facteur sur 6 mois", font_size=13))
+                    fig.update_layout(height=300, yaxis_tickformat=".0%", margin=dict(t=30, l=0, r=0, b=0), title=dict(text="Volatilité du facteur sur 6 mois", font_size=13))
                     graphe(fig, key="wmlvol")
                 kr = A.risque_krach_momentum(adj_eur[BENCH_PRINCIPAL], wml)
                 c = st.columns(4)
@@ -1662,11 +1871,41 @@ def page_momentum():
                 kpi(c[2], "Vol. du momentum", pct(kr["vol_wml"], 0), "6 derniers mois")
                 kpi(c[3], "Exposition conseillée", "—" if pd.isna(kr["echelle_bsc"]) else f"{kr['echelle_bsc']:.1f}×".replace(".", ","),
                             "Barroso et Santa-Clara (2015)", delta_color="off")
+                cum1 = 1 + cumul
+                recul = float(cum1.iloc[-1] / cum1.max() - 1)
+                c = st.columns(4)
+                kpi(c[0], f"Ta liste depuis {cumul.index.min():%m/%Y}", pct(cumul.iloc[-1], 0, True), "gagnants − perdants")
+                if off is not None:
+                    kpi(c[1], "Europe entière", pct(off.iloc[-1], 0, True), f"même période · jusqu'au {off.index.max():%d/%m/%Y}")
+                else:
+                    kpi(c[1], "Europe entière", "—", "données Kenneth French indisponibles", delta_color="off")
+                kpi(c[2], "Recul depuis le plus haut", pct(recul, 0, True), f"plus haut le {cum1.idxmax():%d/%m/%Y}" if recul < -0.005 else "au plus haut", delta_color="off")
+                an = wml.groupby(wml.index.year).agg(lambda x: (1 + x).prod() - 1 if len(x) >= 120 else np.nan).dropna()
+                kpi(c[3], "Meilleure / pire année",
+                    f"{pct(an.max(), 0, True)} / {pct(an.min(), 0, True)}" if len(an) else "—",
+                    f"{an.idxmax()} / {an.idxmin()}" if len(an) else "", delta_color="off")
                 if kr["alerte"]:
                     st.error("Risque de krach du momentum : marché en baisse sur 2 ans et volatilité forte. C'est dans ce contexte que le momentum s'effondre, "
                              "quand les perdants rebondissent violemment (Daniel et Moskowitz, 2016). Ne t'appuie pas sur le momentum pour tes prochains achats.")
+                elif pd.notna(kr["echelle_bsc"]) and kr["echelle_bsc"] < 0.8:
+                    st.warning("Pas de krach au sens de Daniel et Moskowitz (le marché n'est pas baissier sur 2 ans), mais le momentum est agité : sa volatilité "
+                               f"({pct(kr['vol_wml'], 0)}) dépasse nettement la cible de 12 %"
+                               + (f" et le facteur est à {pct(recul, 0, True)} de son plus haut" if recul < -0.10 else "")
+                               + ". Donne-lui moins de poids que d'habitude dans tes choix.")
                 else:
-                    st.success("Pas de signal de krach du momentum : le contexte est normal pour utiliser ce signal.")
+                    st.success("Pas de signal de krach et volatilité normale : le contexte est normal pour utiliser le momentum.")
+                st.markdown(
+                    "**Comment lire ce graphique sans se tromper**\n"
+                    "- **Ce n'est pas ta stratégie.** Ce facteur achète les gagnants *et vend à découvert* les perdants. Toi, tu ne vends rien à découvert. "
+                    "Or les krachs du momentum viennent surtout de la jambe vendeuse : ce sont les perdants qui rebondissent violemment (Daniel et Moskowitz, 2016).\n"
+                    f"- **Environ {max(1, pu.shape[1] // 3)} titres de chaque côté, c'est très peu.** Le facteur officiel utilise des centaines d'actions européennes. Sur ta liste, quelques "
+                    "titres suffisent à faire la courbe : compare avec la courbe « Europe entière ». Si elle monte quand la tienne baisse, c'est ton univers qui est en cause, pas le momentum.\n"
+                    "- **Quelques années ne prouvent rien.** Avec un ratio de Sharpe d'environ 0,5, l'ordre de grandeur historique du momentum, il faut environ "
+                    "(2 ÷ 0,5)² = 16 ans pour qu'une prime soit significative, et une période de 5 à 6 ans perdante arrive environ une fois sur dix. C'est le même raisonnement que la page Chance ou talent.\n"
+                    "- **Biais de sélection.** Ta liste a été choisie en 2026. Des titres qui étaient perdants il y a quelques années et sont devenus des vedettes "
+                    "se retrouvent dans la jambe vendeuse au début de la période, ce qui pénalise artificiellement le facteur.\n"
+                    "- **Ce qui compte pour tes décisions**, ce sont la volatilité récente du facteur et son recul depuis le plus haut : quand ils montent, "
+                    "le momentum doit peser moins dans tes choix (Barroso et Santa-Clara, 2015).")
                 st.caption("L'exposition conseillée vise une volatilité de 12 % pour le facteur : au-dessus de 1, le momentum est calme et fiable ; "
                            "en dessous, il faut lui donner moins de poids dans tes choix.")
             else:
@@ -2678,6 +2917,154 @@ def page_optimisation():
 
 
 # ================================================================== VALORISATION
+# ================================================================== RÉSULTATS ET QUALITÉ
+@st.cache_data(ttl=24 * 3600, show_spinner="Capitalisations boursières (Yahoo)…")
+def capitalisations(tickers):
+    out = {}
+    for t in tickers:
+        if MOCK or yf is None:
+            import zlib
+            out[t] = float(np.exp(np.random.default_rng(zlib.crc32(t.encode())).normal(23.5, 1.0)))
+            continue
+        try:
+            out[t] = float(yf.Ticker(t).fast_info["market_cap"])
+        except Exception as e:
+            log(f"capitalisation {t} : {type(e).__name__}")
+            out[t] = np.nan
+    return pd.Series(out, dtype=float)
+
+
+def _derive_txt(sg, jj):
+    if pd.isna(jj):
+        return "—"
+    if sg == 1:
+        return f"↑ encore ~{max(0, int(87 - jj))} j"
+    if sg == -1:
+        return f"↓ encore ~{max(0, int(87 - jj))} j"
+    return "terminée" if jj > 87 else "neutre"
+
+
+def page_resultats():
+    st.subheader("Résultats, révisions et qualité")
+    intro("Quatre familles de signaux qui résistent aux études de réplication (Hou, Xue et Zhang, 2020 ; Jensen, Kelly et Pedersen, 2023) : "
+          "<b>la surprise de résultats</b> et la dérive qui la suit, <b>les révisions des analystes</b>, <b>la rentabilité brute</b> et "
+          "<b>la discipline d'investissement</b> (croissance de l'actif, émissions d'actions). Ils complètent le momentum et la valorisation ; "
+          "aucun ne suffit seul pour décider.")
+    univ_all = charger_univers()
+    c1, c2 = st.columns([3, 2])
+    ajout = c1.multiselect("Comparer avec des titres de l'univers", [t for t in univ_all.index if t not in pf.index], key="res_univ",
+                           format_func=lambda t: f"{univ_all.loc[t, 'nom']} ({t})", placeholder="Aucun : seulement tes lignes")
+    libres = c2.text_input("Ou d'autres tickers Yahoo (séparés par des virgules)", key="res_libres", placeholder="ex. SU.PA, NEXI.MI")
+    libres = [x.strip().upper() for x in libres.split(",") if x.strip()]
+    tick = list(pf.index) + [t for t in list(ajout) + libres if t not in pf.index]
+    tick = list(dict.fromkeys(tick))
+    sect = tuple(sorted((t, str(pf.loc[t, "secteur"]) if t in pf.index else str(univ_all["secteur"].get(t, ""))) for t in tick))
+    res_f, maj = lire_resultats()
+    deja = not res_f.empty and all(t in res_f.index for t in tick)
+    if st.button("Charger ou actualiser les données Yahoo", type="secondary" if deja else "primary", key="res_btn"):
+        st.session_state["res_charge"] = True
+    if st.session_state.get("res_charge"):
+        res = donnees_resultats(tuple(tick), sect)
+        maj = dt.datetime.now().isoformat() if maj is None else maj
+    elif deja:
+        res = res_f.reindex(tick)
+    else:
+        st.info("Clique sur le bouton : la première fois, Yahoo met une à deux minutes pour tes lignes. Les données sont ensuite gardées 24 heures "
+                "et alimentent aussi les alertes du tableau de bord.")
+        return
+    auj = pd.Timestamp.now(tz=TZ).normalize().tz_localize(None)
+    rows = []
+    for t in tick:
+        r = res.loc[t] if t in res.index else pd.Series(dtype=object)
+        g = lambda k: pd.to_numeric(r.get(k), errors="coerce")
+        sg, jj = A.signal_pead(g("surprise"), r.get("date_pub"), auj)
+        gp, ca, em, r90, r30, nr = g("gp_a"), g("croiss_actif"), g("emission"), g("rev90"), g("rev30"), g("net_rev30")
+        plus = int(sum([sg == 1, pd.notna(r90) and r90 > 0.02, pd.notna(gp) and gp >= 0.30, pd.notna(ca) and ca < 0.05, pd.notna(em) and em < -0.005]))
+        moins = int(sum([sg == -1, pd.notna(r90) and r90 < -0.02, pd.notna(gp) and gp < 0.10, pd.notna(ca) and ca > 0.20, pd.notna(em) and em > 0.02]))
+        nom = pf.loc[t, "nom"] if t in pf.index else (univ_all.loc[t, "nom"] if t in univ_all.index else t)
+        dp = r.get("date_pub")
+        rows.append({"ticker": t, "nom": nom if t in pf.index else f"{nom} (candidat)", "detenu": t in pf.index,
+                     "surprise": g("surprise"), "date_pub": pd.Timestamp(dp) if isinstance(dp, str) and dp else pd.NaT,
+                     "derive": _derive_txt(sg, jj), "pead": sg, "rev30": r30, "rev90": r90, "net_rev30": nr,
+                     "gp_a": gp, "croiss_actif": ca, "emission": em, "plus": plus, "moins": moins})
+    df = pd.DataFrame(rows)
+    mine = df[df["detenu"]]
+    c = st.columns(4)
+    kpi(c[0], "Dérive post-annonce favorable", f"{int((mine['pead'] == 1).sum())} lignes", f"défavorable : {int((mine['pead'] == -1).sum())}", delta_color="off")
+    kpi(c[1], "Prévisions relevées sur 90 j", f"{int((mine['rev90'] > 0.02).sum())} lignes", f"abaissées : {int((mine['rev90'] < -0.02).sum())}", delta_color="off")
+    gp_med = mine["gp_a"].median()
+    kpi(c[2], "Rentabilité brute médiane", pct(gp_med, 0) if pd.notna(gp_med) else "—", "marge brute ÷ actif, hors financières", delta_color="off")
+    couv = float(mine[["surprise", "rev90", "gp_a"]].notna().mean().mean()) if len(mine) else np.nan
+    kpi(c[3], "Données disponibles", pct(couv, 0) if pd.notna(couv) else "—",
+        f"mises à jour le {pd.Timestamp(maj):%d/%m à %H:%M}" if maj else "", delta_color="off")
+
+    vue = df.sort_values(["detenu", "moins", "plus"], ascending=[False, False, True])
+    f_pct = lambda d_=0, sg_=True: (lambda v: "—" if pd.isna(v) else pct(v, d_, sg_))
+    vue = vue.copy()
+    vue["surprise_txt"] = [("—" if pd.isna(v) else pct(v, 1, True) + (f" ({d_:%d/%m})" if pd.notna(d_) else "")) for v, d_ in zip(vue["surprise"], vue["date_pub"])]
+    vue["bilan"] = [f"{p_} + / {m_} −" for p_, m_ in zip(vue["plus"], vue["moins"])]
+    tableau(vue[["nom", "surprise_txt", "derive", "rev90", "net_rev30", "gp_a", "croiss_actif", "emission", "bilan"]].style.format({
+        "rev90": f_pct(1),
+        "net_rev30": lambda v: "—" if pd.isna(v) else f"{int(v):+d}", "gp_a": f_pct(0, False), "croiss_actif": f_pct(0), "emission": f_pct(1),
+        })
+        .map(lambda v: f"color:{C_BON}" if isinstance(v, str) and v.startswith("+") else (f"color:{C_MAUVAIS}" if isinstance(v, str) and v.startswith("-") else ""), subset=["surprise_txt"])
+        .map(signe_couleur, subset=["rev90", "net_rev30"])
+        .map(lambda v: f"color:{C_MAUVAIS}" if pd.notna(v) and v > 0.20 else "", subset=["croiss_actif"])
+        .map(lambda v: f"color:{C_MAUVAIS}" if pd.notna(v) and v > 0.02 else (f"color:{C_BON}" if pd.notna(v) and v < -0.005 else ""), subset=["emission"])
+        .map(lambda v: f"color:{C_BON};font-weight:600" if isinstance(v, str) and v.startswith("↑") else (f"color:{C_MAUVAIS};font-weight:600" if isinstance(v, str) and v.startswith("↓") else ""), subset=["derive"])
+        .apply(lambda col: [f"color:{C_MAUVAIS};font-weight:600" if m_ >= 2 else (f"color:{C_BON};font-weight:600" if p_ >= 2 and m_ == 0 else "")
+                            for p_, m_ in zip(vue["plus"], vue["moins"])], subset=["bilan"]),
+        column_config={"nom": "Ligne", "surprise_txt": "Surprise", "derive": "Dérive",
+                       "rev90": "BPA 90 j", "net_rev30": "Analystes",
+                       "gp_a": "Rentab.", "croiss_actif": "Actif 1 an", "emission": "Émissions",
+                       "bilan": "Signaux"})
+    st.caption("Surprise : bénéfice publié face au consensus. Dérive : sens attendu du cours après la surprise et jours restants. "
+               "BPA 90 j : révision du bénéfice attendu pour l'exercice en cours. Analystes : nombre de hausses moins nombre de baisses de prévision sur 30 jours. Rentab. : rentabilité brute. "
+               "Actif 1 an : croissance de l'actif total. Émissions : variation du nombre d'actions (négatif = rachats).")
+    st.caption("« — » : donnée absente chez Yahoo (fréquent pour les petites valeurs et les financières). La rentabilité brute n'a pas de sens pour les banques et assureurs.")
+
+    g, d = st.columns(2)
+    with g:
+        z = df.dropna(subset=["rev90"]).sort_values("rev90")
+        if len(z):
+            fig = go.Figure(go.Bar(x=z["rev90"], y=z["nom"], orientation="h", marker_color=[C_BON if v >= 0 else C_MAUVAIS for v in z["rev90"]],
+                                   text=[pct(v, 1, True) for v in z["rev90"]], textposition="outside", hovertemplate="%{y} : %{x:+.1%}<extra></extra>"))
+            lo, hi = min(0.0, float(z["rev90"].min())), max(0.0, float(z["rev90"].max()))
+            pad = 0.45 * max(hi - lo, 0.01)
+            fig.update_layout(height=max(280, 22 * len(z)), margin=dict(t=36, l=0, r=10, b=0), xaxis_tickformat="+.0%",
+                              xaxis_range=[lo - pad * (lo < 0), hi + pad * (hi > 0)],
+                              title=dict(text="Révision du bénéfice attendu sur 90 jours", font_size=13))
+            graphe(fig, key="rev90")
+    with d:
+        z = df.dropna(subset=["gp_a", "croiss_actif"])
+        if len(z):
+            fig = go.Figure(go.Scatter(x=z["croiss_actif"], y=z["gp_a"], mode="markers+text", text=z["nom"].str.replace(" (candidat)", "*", regex=False),
+                                       textposition="top center", textfont_size=10, marker=dict(size=10, color=[PALETTE[0] if x else PALETTE[2] for x in z["detenu"]]),
+                                       hovertemplate="%{text}<br>Croissance de l'actif %{x:+.0%}<br>Rentabilité brute %{y:.0%}<extra></extra>"))
+            fig.add_hline(y=0.30, line_dash="dot", line_color=C_NEUTRE)
+            fig.add_vline(x=0.20, line_dash="dot", line_color=C_NEUTRE)
+            fig.update_layout(height=max(280, 22 * len(df.dropna(subset=['rev90']))), margin=dict(t=36, l=0, r=30, b=0), xaxis_tickformat="+.0%", yaxis_tickformat=".0%",
+                              xaxis_title="Croissance de l'actif sur un an", yaxis_title="Rentabilité brute",
+                              title=dict(text="Qualité et discipline : en haut à gauche, c'est mieux", font_size=13))
+            graphe(fig, key="qualite")
+
+    st.markdown("### Comment lire ces indicateurs")
+    st.markdown(
+        "- **Surprise de résultats et dérive post-annonce** (Bernard et Thomas, 1989). L'écart entre le bénéfice publié et le consensus. "
+        "Le cours tend à continuer dans le sens de la surprise pendant environ 60 jours de bourse (≈ 3 mois) : c'est l'une des anomalies les plus robustes. "
+        "Seuil retenu : ±2 %.\n"
+        "- **Révisions des analystes** (Chan, Jegadeesh et Lakonishok, 1996). Les titres dont le bénéfice attendu est revu à la hausse continuent de "
+        "surperformer, car les analystes ajustent lentement. « Analystes ↑ − ↓ » compte ceux qui ont relevé moins ceux qui ont abaissé sur 30 jours.\n"
+        "- **Rentabilité brute** (Novy-Marx, 2013). Marge brute ÷ actif total. Plus prédictive que le ROE, qui peut être gonflé par la dette. "
+        "Au-dessus de 30 %, c'est une entreprise de qualité ; sous 10 %, c'est faible (sauf modèles très capitalistiques comme les utilities).\n"
+        "- **Croissance de l'actif** (Cooper, Gulen et Schill, 2008). Les entreprises qui grossissent très vite (acquisitions, investissements massifs) "
+        "font en moyenne moins bien ensuite. Alerte au-dessus de +20 % sur un an.\n"
+        "- **Émission d'actions** (Pontiff et Woodgate, 2008). Une entreprise qui émet des actions les juge souvent chères ; une entreprise qui en rachète, "
+        "bon marché. Positif sous −0,5 % (rachats), négatif au-dessus de +2 %.\n\n"
+        "**Signaux + / −** : le nombre d'indicateurs favorables et défavorables. Deux signaux négatifs ou plus sur une ligne détenue méritent de relire sa fiche. "
+        "Ces effets sont mesurés sur des milliers d'actions : sur une ligne isolée, ils déplacent les probabilités, ils ne garantissent rien.")
+
+
 def page_valorisation():
     st.subheader("Valorisation")
     intro("Ce que tu paies pour la croissance attendue. Les règles : PEG ≤ 2 pour les valeurs de croissance (Lynch), ratio de Lynch ≥ 1 pour les croissances "
@@ -2754,6 +3141,28 @@ def page_score():
     kpi(c[2], "Performance ÷ risque prévu", f"{ratio_pr:.2f}".replace(".", ",") if pd.notna(ratio_pr) else "—",
         "la pente de la carte APTimum (droite rouge à 0,3)", delta_color="off")
     kpi(c[3], "Quiz", "à faire", "points sans risque : fais-les tous", delta_color="off")
+
+    st.markdown("### Ton portefeuille face au marché : active share")
+    intro("La part de ton portefeuille qui diffère du marché (Cremers et Petajisto, 2009) : 0 % = une copie de l'indice, 100 % = aucun titre en commun. "
+          "C'est la réponse chiffrée à « vos actions sont toutes dans l'indice » : ce qui compte, ce sont les poids, pas la liste des titres. "
+          "Le marché est approché par ton univers large et tes lignes, pondérés par leur capitalisation.")
+    if st.button("Calculer l'active share (environ une minute la première fois)", key="as_btn"):
+        st.session_state["as_charge"] = True
+    if st.session_state.get("as_charge"):
+        u_ = charger_univers()
+        t_idx = tuple(sorted(set(u_.index) | set(pf.index)))
+        caps = capitalisations(t_idx).dropna()
+        w_p = pf["valeur"].dropna()
+        a_s = A.active_share(w_p, caps)
+        commun = caps.index.intersection(w_p.index)
+        c = st.columns(3)
+        kpi(c[0], "Active share", pct(a_s, 0) if pd.notna(a_s) else "—", "au-dessus de 80 % : gestion vraiment active", delta_color="off")
+        kpi(c[1], "Recouvrement avec le marché", pct(1 - a_s, 0) if pd.notna(a_s) else "—", f"{len(commun)} titres en commun sur {len(caps)}", delta_color="off")
+        kpi(c[2], "Poids de tes titres dans le marché", pct(caps.reindex(commun).sum() / caps.sum(), 0) if len(caps) else "—",
+            "contre 100 % de ton portefeuille", delta_color="off")
+        st.caption("Cremers et Petajisto classent les fonds au-dessus de 80 % parmi les vrais gérants actifs, et ceux sous 60 % parmi les « faux actifs » "
+                   "qui facturent une gestion active pour un quasi-indice. Un active share élevé ne prouve aucun talent : il dit seulement que ton résultat "
+                   "pourra beaucoup s'écarter de celui du marché, en bien comme en mal.")
 
     st.markdown("### Ce qui ferait gagner des points")
     actions = []
@@ -2889,7 +3298,7 @@ def page_rapport():
 GUIDE = {
     "Ta routine": """
 - **Chaque jour, 2 minutes** : le *Tableau de bord*. Regarde les alertes rouges et les contraintes, puis la carte des lignes.
-- **Avant chaque achat** : *Candidats* pour trouver, *Valorisation* et MarketScreener pour vérifier, *Simulateur* pour tester, puis écris la thèse, la menace et la condition de sortie dans lignes.csv.
+- **Avant chaque achat** : *Candidats* pour trouver, *Valorisation*, *Résultats et qualité* et MarketScreener pour vérifier, *Simulateur* pour tester, puis écris la thèse, la menace et la condition de sortie dans lignes.csv.
 - **Le 1er de chaque mois** : *Rééquilibrage* (ordres et test de la page blanche), *Règles*, *Risque*, *Stress tests*, puis *Chance ou talent* sur le mois écoulé. Note trois chiffres : ton percentile à risque égal, ton ratio de diversification, ta plus forte baisse. Termine par le *Rapport*, à enregistrer en PDF.
 - **Après chaque ordre** : ajoute la ligne dans transactions.csv (date AAAA-MM-JJ, point décimal, prix en euros = montant NextWise ÷ quantité).
 """,
@@ -2897,6 +3306,13 @@ GUIDE = {
 - Les quatre critères sans chance : **HHI** (plus bas = moins concentré ; le minimum avec N lignes à poids égaux est 1/N), **secteurs couverts sur 11**, **ratio de diversification**, **UCITS**. Plus les **quiz**.
 - La liste « ce qui ferait gagner des points » est recalculée à chaque ouverture : secteur manquant, écart à la diversification maximale, cash qui ne travaille pas, contrainte dépassée.
 - Le message tout prêt pour les organisateurs : pondération des critères, mesure du risque, dividendes.
+""",
+    "Résultats et qualité": """
+- **À ouvrir pendant chaque saison de résultats** (fin janvier – mars, juillet, octobre) et avant chaque achat. Clique sur le bouton une fois : les données sont gardées 24 h et alimentent les alertes du tableau de bord.
+- **Dérive post-annonce** : après une surprise de plus de 2 %, le cours tend à continuer dans le même sens pendant environ 3 mois. Une flèche rouge sur une ligne détenue = relire sa fiche ; une flèche verte sur un candidat = bon moment pour l'étudier.
+- **Révisions** : un bénéfice attendu abaissé de plus de 5 % en 90 jours déclenche une alerte orange.
+- **Rentabilité brute et croissance de l'actif** : en haut à gauche du nuage (rentable et discipliné), c'est le profil qui fait le mieux en moyenne.
+- Teste n'importe quel candidat avec le champ des tickers libres, comme dans Rééquilibrage.
 """,
     "Tableau de bord": """
 - **Bandeau** : valeur totale et variation du jour, gain du jour face à l'Euronext 100, performance depuis le départ (même calcul que NextWise), cash, volatilité prévue, bêta, ratio de diversification.
@@ -2976,6 +3392,7 @@ NAV = {
         st.Page(page_performance, title="Performance", icon=":material/trending_up:", url_path="performance"),
         st.Page(page_momentum, title="Momentum", icon=":material/speed:", url_path="momentum"),
         st.Page(page_valorisation, title="Valorisation", icon=":material/sell:", url_path="valorisation"),
+        st.Page(page_resultats, title="Résultats et qualité", icon=":material/fact_check:", url_path="resultats"),
         st.Page(page_chance, title="Chance ou talent", icon=":material/casino:", url_path="chance-ou-talent"),
     ],
     "Outils": [
