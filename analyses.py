@@ -669,3 +669,67 @@ def hhi(poids):
     w = w / w.sum()
     h = float((w ** 2).sum())
     return h, 1 / h
+
+
+# ---------------------------------------------------------------- qualité, investissement, résultats (v7)
+def rentabilite_brute(marge_brute, actif_total):
+    """Rentabilité brute de Novy-Marx (2013) : marge brute ÷ actif total. Plus prédictive des rendements futurs que le ROE,
+    qui peut être gonflé par la dette. Non pertinente pour les banques et assureurs (pas de marge brute)."""
+    try:
+        gp, ta = float(marge_brute), float(actif_total)
+    except (TypeError, ValueError):
+        return np.nan
+    if not np.isfinite(gp) or not np.isfinite(ta) or ta <= 0:
+        return np.nan
+    return gp / ta
+
+
+def variation_annuelle(actuel, precedent):
+    """Croissance d'une année sur l'autre (actif total : Cooper, Gulen et Schill, 2008 ; nombre d'actions : Pontiff et Woodgate, 2008)."""
+    try:
+        a, p = float(actuel), float(precedent)
+    except (TypeError, ValueError):
+        return np.nan
+    if not np.isfinite(a) or not np.isfinite(p) or p <= 0:
+        return np.nan
+    return a / p - 1
+
+
+def revision_prevision(actuelle, ancienne):
+    """Révision du consensus de bénéfice par action, en % de la valeur absolue de l'ancienne prévision
+    (Chan, Jegadeesh et Lakonishok, 1996)."""
+    try:
+        a, o = float(actuelle), float(ancienne)
+    except (TypeError, ValueError):
+        return np.nan
+    if not np.isfinite(a) or not np.isfinite(o) or abs(o) < 1e-9:
+        return np.nan
+    return (a - o) / abs(o)
+
+
+def signal_pead(surprise, date_publication, aujourd_hui, fenetre=60, seuil=0.02):
+    """Dérive post-annonce (Bernard et Thomas, 1989) : le cours tend à continuer dans le sens de la surprise pendant
+    environ 60 jours de bourse. Renvoie +1, −1 ou 0, et le nombre de jours calendaires depuis la publication."""
+    if surprise is None or pd.isna(surprise) or date_publication is None or pd.isna(date_publication):
+        return 0, np.nan
+    jours = (pd.Timestamp(aujourd_hui) - pd.Timestamp(date_publication)).days
+    if jours < 0 or jours > fenetre * 1.45:          # 60 jours de bourse ≈ 87 jours calendaires
+        return 0, jours
+    if surprise > seuil:
+        return 1, jours
+    if surprise < -seuil:
+        return -1, jours
+    return 0, jours
+
+
+def active_share(poids_portefeuille, poids_indice):
+    """Active share de Cremers et Petajisto (2009) : ½ Σ |w_portefeuille − w_indice|, les deux portefeuilles ramenés à 100 %
+    de leur partie investie. 0 = copie de l'indice, 1 = aucun titre en commun."""
+    wp = pd.Series(poids_portefeuille, dtype=float).dropna()
+    wb = pd.Series(poids_indice, dtype=float).dropna()
+    wp, wb = wp[wp > 0], wb[wb > 0]
+    if wp.empty or wb.empty:
+        return np.nan
+    wp, wb = wp / wp.sum(), wb / wb.sum()
+    tous = wp.index.union(wb.index)
+    return float(0.5 * (wp.reindex(tous, fill_value=0) - wb.reindex(tous, fill_value=0)).abs().sum())
