@@ -111,4 +111,15 @@ tr, _ = A.ratios(b2, b2, 0.0)
 v_ = tr.set_index("ratio")["portefeuille"]
 test("ratios : copie de l'indice -> bêta 1, écart de suivi 0, capture 1", abs(v_["Bêta"] - 1) < 1e-9 and v_["Écart de suivi"] < 1e-12 and abs(v_["Capture haussière"] - 1) < 1e-9)
 
+# v7 : qualité, investissement, révisions, dérive post-annonce, active share
+test("rentabilité brute : 30 / 100 = 0,30 ; actif nul -> NaN", abs(A.rentabilite_brute(30, 100) - 0.3) < 1e-12 and np.isnan(A.rentabilite_brute(30, 0)))
+test("croissance de l'actif : 110 / 100 -> +10 %", abs(A.variation_annuelle(110, 100) - 0.10) < 1e-12 and np.isnan(A.variation_annuelle(1, None)))
+test("révision : de −2 à −1 = +50 % (valeur absolue)", abs(A.revision_prevision(-1, -2) - 0.5) < 1e-12)
+s_, j_ = A.signal_pead(0.08, "2026-10-01", "2026-11-05"); s2_, _ = A.signal_pead(-0.08, "2026-06-01", "2026-11-05")
+test("dérive post-annonce : surprise +8 % il y a 35 j -> +1 ; il y a 157 j -> 0", s_ == 1 and j_ == 35 and s2_ == 0)
+test("active share : copie = 0, aucun titre commun = 1, moitié commune = 0,5",
+     abs(A.active_share({"a": .5, "b": .5}, {"a": .5, "b": .5})) < 1e-12 and abs(A.active_share({"a": 1}, {"b": 1}) - 1) < 1e-12
+     and abs(A.active_share({"a": .5, "b": .5}, {"a": .5, "c": .5}) - 0.5) < 1e-12)
+test("active share : les poids sont ramenés à 100 % (cash ignoré)", abs(A.active_share({"a": .4, "b": .4}, {"a": 1, "b": 1})) < 1e-12)
+
 print("\nTOUS LES TESTS PASSENT" if ok else "\nAU MOINS UN TEST ÉCHOUE")
