@@ -43,9 +43,10 @@ def regression(y, x):
     s2 = res @ res / (n - k)
     cov = s2 * np.linalg.inv(X.T @ X)
     t_a = coef[0] / np.sqrt(cov[0, 0]) if cov[0, 0] > 0 else np.nan
+    t_b = coef[1] / np.sqrt(cov[1, 1]) if cov[1, 1] > 0 else np.nan
     r2 = 1 - (res @ res) / ((yv - yv.mean()) @ (yv - yv.mean())) if yv.var() > 0 else np.nan
     r2_adj = 1 - (1 - r2) * (n - 1) / (n - k) if pd.notna(r2) and n > k else np.nan   # k = 2 paramètres (constante + bêta)
-    return {"alpha": coef[0], "beta": coef[1], "residus": pd.Series(res, index=z.index), "t_alpha": t_a,
+    return {"alpha": coef[0], "beta": coef[1], "residus": pd.Series(res, index=z.index), "t_alpha": t_a, "t_beta": t_b,
             "r2": r2, "r2_adj": r2_adj, "n": n, "x": pd.Series(xv, index=z.index), "y": pd.Series(yv, index=z.index)}
 
 
@@ -434,32 +435,48 @@ def sensibilites(R, facteurs):
 
 
 # ======================================================================= optimisation
-def _contraintes_poids(n, borne):
+def _contraintes_poids(n, borne, plancher=0.0):
     from scipy.optimize import Bounds
-    return Bounds(np.zeros(n), np.full(n, borne)), [{"type": "eq", "fun": lambda w: w.sum() - 1}]
+    return Bounds(np.full(n, min(plancher, 1 / n)), np.full(n, borne)), [{"type": "eq", "fun": lambda w: w.sum() - 1, "jac": lambda w: np.ones(n)}]
 
 
-def optimiser(cov, mode, borne=0.10):
+def optimiser(cov, mode, borne=0.10, groupes=None, plancher=0.0):
     """Portefeuilles fondés sur le risque seul (sans prévision de rendement, donc robustes) :
     'minvar' variance minimale, 'mdp' diversification maximale (Choueifaty et Coignard, 2008),
-    'erc' parité de risque (Maillard, Roncalli et Teïletche, 2010)."""
+    'erc' parité de risque (Maillard, Roncalli et Teïletche, 2010).
+    groupes : liste de (masque booléen, plafond) pour limiter le poids d'un secteur ou d'une place."""
     from scipy.optimize import minimize
     n = cov.shape[0]
     sig = np.sqrt(np.diag(cov))
     w0 = np.full(n, 1 / n)
-    bornes, cons = _contraintes_poids(n, max(borne, 1 / n + 1e-6))
+    bornes, cons = _contraintes_poids(n, max(borne, 1 / n + 1e-6), plancher)
+    for masque, plafond in (groupes or []):
+        m = np.asarray(masque, dtype=bool)
+        if m.any() and m.sum() / n <= plafond + 1e-9:      # ignorée si les poids égaux la violent déjà (point de départ infaisable)
+            cons = cons + [{"type": "ineq", "fun": lambda w, m=m, c=plafond: c - w[m].sum(), "jac": lambda w, m=m: -m.astype(float)}]
+    jac = None          # gradients exacts : dix fois plus rapide que la dérivation numérique
     if mode == "minvar":
         f = lambda w: w @ cov @ w * 1e4
+        jac = lambda w: 2e4 * (cov @ w)
     elif mode == "mdp":
         f = lambda w: -(w @ sig) / np.sqrt(w @ cov @ w)
-    elif mode == "erc":
-        def f(w):
+        def jac(w):
             v = w @ cov @ w
-            rc = w * (cov @ w)
-            return ((rc - v / n) ** 2).sum() * 1e8
+            return -(sig / np.sqrt(v) - (w @ sig) * (cov @ w) / v ** 1.5)
+    elif mode == "erc":
+        # écart des parts de risque à 1/n ; formulation sans unité : l'ancienne (× 1e8) pouvait rester bloquée sur les poids égaux
+        def f(w):
+            g = cov @ w
+            return ((w * g / (w @ g) - 1 / n) ** 2).sum() * 1e2
+        def jac(w):
+            g = cov @ w
+            v = w @ g
+            sh = w * g / v
+            d = sh - 1 / n
+            return 2e2 / v * (d * g + cov @ (w * d) - 2 * g * (d @ sh))
     else:
         return w0
-    r = minimize(f, w0, method="SLSQP", bounds=bornes, constraints=cons, options={"maxiter": 500, "ftol": 1e-12})
+    r = minimize(f, w0, jac=jac, method="SLSQP", bounds=bornes, constraints=cons, options={"maxiter": 500, "ftol": 1e-12})
     w = np.clip(r.x, 0, None)
     return w / w.sum()
 
@@ -625,6 +642,8 @@ def ratios(r, rb, rf_annuel=0.0):
     alpha_j = reg["alpha"] * 252 if reg else np.nan
     bas = b < 0
     beta_bas = np.cov(p[bas], b[bas])[0, 1] / b[bas].var() if bas.sum() > 10 and b[bas].var() > 0 else np.nan
+    hau = b > 0
+    beta_haut = np.cov(p[hau], b[hau])[0, 1] / b[hau].var() if hau.sum() > 10 and b[hau].var() > 0 else np.nan
     te = (p - b).std(ddof=1) * np.sqrt(252)
     ir = (an(p) - an(b)) / te if te > 0 else np.nan
     sh_p, sh_b = sharpe_lo(p, rf_annuel), sharpe_lo(b, rf_annuel)
@@ -646,6 +665,7 @@ def ratios(r, rb, rf_annuel=0.0):
         ("Expected Shortfall 95 % (1 jour)", -p[p <= np.percentile(p, 5)].mean(), -b[b <= np.percentile(b, 5)].mean(), "Perte moyenne les jours au-delà de la VaR."),
         ("Bêta", beta, 1.0, "Sensibilité aux mouvements de l'indice."),
         ("Bêta à la baisse", beta_bas, 1.0, "Bêta calculé seulement les jours de baisse de l'indice (Ang, Chen et Xing, 2006)."),
+        ("Bêta à la hausse", beta_haut, 1.0, "Bêta calculé seulement les jours de hausse de l'indice. L'idéal : plus élevé que le bêta à la baisse. Chacun repose sur la moitié des séances, donc un petit écart entre les deux n'est pas significatif."),
         ("Alpha de Jensen (annualisé)", alpha_j, 0.0, "Rendement non expliqué par le bêta (Jensen, 1968)."),
         ("Ratio de Treynor", (an(p) - rf_annuel) / beta if beta and pd.notna(beta) and beta != 0 else np.nan, an(b) - rf_annuel, "Excès de rendement ÷ bêta : la rémunération du risque de marché."),
         ("Écart de suivi", te, 0.0, "Volatilité de l'écart quotidien avec l'indice."),
@@ -733,3 +753,270 @@ def active_share(poids_portefeuille, poids_indice):
     wp, wb = wp / wp.sum(), wb / wb.sum()
     tous = wp.index.union(wb.index)
     return float(0.5 * (wp.reindex(tous, fill_value=0) - wb.reindex(tous, fill_value=0)).abs().sum())
+
+
+# ---------------------------------------------------------------- portefeuille modèle (v8)
+def _z(x):
+    """Score centré réduit, borné à ±3 pour qu'une valeur extrême ne décide pas seule."""
+    x = pd.Series(x, dtype=float)
+    e = x.std(ddof=0)
+    return ((x - x.mean()) / e).clip(-3, 3) if e and e > 0 else x * 0.0
+
+
+def signaux_modele(prix, date):
+    """Signaux calculés uniquement avec les cours connus à la date donnée (aucune information du futur) :
+    momentum 12-1 (Jegadeesh et Titman, 1993), faible volatilité sur un an (Blitz et van Vliet, 2007),
+    proximité du plus haut sur 52 semaines (George et Hwang, 2004), asymétrie de bêta (bêta à la hausse moins bêta à la baisse,
+    dans l'esprit de Ang, Chen et Xing, 2006 ; signal bruité, proposé pour être testé, pas recommandé par défaut)."""
+    h = prix.loc[:date]
+    if len(h) < 275:
+        return pd.DataFrame()
+    f = h.iloc[-275:]
+    ok = (f.notna().sum() >= 255) & f.iloc[-1].notna() & f.iloc[-22].notna() & f.iloc[-253].notna()
+    f = f.loc[:, ok]
+    if f.shape[1] == 0:
+        return pd.DataFrame()
+    r = f.pct_change(fill_method=None).iloc[-252:]
+    # asymétrie de bêta : bêta les jours de hausse moins bêta les jours de baisse, face à la moyenne de l'univers
+    X = r.fillna(0.0).values
+    m = X.mean(axis=1)
+    def _beta(masque):
+        if masque.sum() < 30:
+            return np.full(X.shape[1], np.nan)
+        mc = m[masque] - m[masque].mean()
+        den = mc @ mc
+        return (X[masque] - X[masque].mean(axis=0)).T @ mc / den if den > 0 else np.full(X.shape[1], np.nan)
+    return pd.DataFrame({"momentum": f.iloc[-22] / f.iloc[-253] - 1,
+                         "vol": r.std(ddof=1) * np.sqrt(252),
+                         "haut52": f.iloc[-1] / f.iloc[-252:].max(),
+                         "asym_beta": pd.Series(_beta(m > 0) - _beta(m < 0), index=f.columns)})
+
+
+def selection_modele(sig, secteurs, places, n=26, poids_signaux=None, cap_secteur=0.20, cap_place=0.30):
+    """Classe les titres par score composite (moyenne pondérée des scores centrés réduits) puis retient les n premiers
+    en respectant un nombre maximal de titres par secteur et par place, pour que les plafonds restent atteignables."""
+    ps = {"momentum": 1.0, "faible_vol": 1.0, "haut52": 0.0, "asym_beta": 0.0, **(poids_signaux or {})}
+    if sig is None or sig.empty:
+        return [], pd.Series(dtype=float)
+    z = pd.DataFrame({"momentum": _z(sig["momentum"]), "faible_vol": -_z(sig["vol"]), "haut52": _z(sig["haut52"]),
+                      "asym_beta": _z(sig["asym_beta"]).fillna(0.0) if "asym_beta" in sig else 0.0})
+    tot = sum(abs(v) for v in ps.values())
+    score = sum(ps[k] * z[k] for k in z.columns) / tot if tot > 0 else z.mean(axis=1) * 0.0
+    score = score.dropna().sort_values(ascending=False, kind="mergesort")
+    n = int(min(n, len(score)))
+    max_s, max_p = max(1, int(np.floor(cap_secteur * n + 1e-9))), max(1, int(np.floor(cap_place * n + 1e-9)))
+    cs, cp, choisis = {}, {}, []
+    for t in score.index:
+        s_, p_ = secteurs.get(t, "?"), places.get(t, "?")
+        if cs.get(s_, 0) >= max_s or cp.get(p_, 0) >= max_p:
+            continue
+        choisis.append(t)
+        cs[s_], cp[p_] = cs.get(s_, 0) + 1, cp.get(p_, 0) + 1
+        if len(choisis) == n:
+            break
+    return choisis, score
+
+
+def poids_modele(prix, date, titres, secteurs, places, mode="mdp", borne=0.10, cap_secteur=0.20, cap_place=0.30, retrecissement=0.2):
+    """Poids fondés sur le risque seul, estimé sur un an de cours connus à la date. La matrice de covariance est
+    rétrécie vers sa diagonale (dans l'esprit de Ledoit et Wolf, 2004) pour limiter l'erreur d'estimation.
+    Chaque ligne retenue reçoit au moins 1,5 % (ou la moitié du poids égal), pour ne pas garder de ligne vide."""
+    n = len(titres)
+    if n == 0:
+        return pd.Series(dtype=float)
+    if mode == "egal" or n < 3:
+        return pd.Series(1 / n, index=titres)
+    r = prix.loc[:date, titres].pct_change(fill_method=None).iloc[-252:]
+    S = r.cov().values * 252
+    if not np.isfinite(S).all():
+        return pd.Series(1 / n, index=titres)
+    S = (1 - retrecissement) * S + retrecissement * np.diag(np.diag(S))
+    sec, pla = np.array([secteurs.get(t, "?") for t in titres]), np.array([places.get(t, "?") for t in titres])
+    groupes = [(sec == g, cap_secteur) for g in np.unique(sec)] + [(pla == g, cap_place) for g in np.unique(pla)]
+    try:
+        w = optimiser(S, mode, borne, groupes, plancher=min(0.015, 0.5 / n))    # aucune ligne « fantôme » à 0 %
+    except Exception:
+        w = np.full(n, 1 / n)
+    if not np.isfinite(w).all():
+        w = np.full(n, 1 / n)
+    return pd.Series(w, index=titres)
+
+
+def _dates_rebal(prix):
+    """Dernier jour de bourse de chaque mois, plus la dernière date disponible."""
+    fins = prix.groupby([prix.index.year, prix.index.month]).tail(1).index
+    return list(fins) if fins[-1] == prix.index[-1] else list(fins) + [prix.index[-1]]
+
+
+def backtest_modele(prix, secteurs, places, n=26, poids_signaux=None, mode="mdp", borne=0.10, cap_secteur=0.20, cap_place=0.30):
+    """Test hors échantillon « pas à pas » : à chaque fin de mois, le portefeuille est reconstruit avec les seules données
+    connues ce jour-là, puis détenu le mois suivant (poids fixes dans le mois). Renvoie les rendements quotidiens,
+    les compositions successives, la rotation moyenne et le rendement de l'univers à poids égaux (mêmes titres éligibles)."""
+    R = prix.pct_change(fill_method=None)
+    dates = _dates_rebal(prix)
+    morceaux, ew, compos, rot, w_prec = [], [], {}, [], None
+    for d0, d1 in zip(dates[:-1], dates[1:]):
+        sig = signaux_modele(prix, d0)
+        if sig.empty or len(sig) < max(6, min(n, 10)):
+            continue
+        titres, _ = selection_modele(sig, secteurs, places, n, poids_signaux, cap_secteur, cap_place)
+        if len(titres) < 3:
+            continue
+        w = poids_modele(prix, d0, titres, secteurs, places, mode, borne, cap_secteur, cap_place)
+        fen = R.loc[(R.index > d0) & (R.index <= d1)]
+        if fen.empty:
+            continue
+        morceaux.append(fen[titres].fillna(0.0) @ w)
+        ew.append(fen[sig.index].mean(axis=1, skipna=True))
+        compos[d0] = w
+        if w_prec is not None:
+            tous = w.index.union(w_prec.index)
+            rot.append(0.5 * (w.reindex(tous, fill_value=0) - w_prec.reindex(tous, fill_value=0)).abs().sum())
+        w_prec = w
+    if not morceaux:
+        return None
+    return {"r": pd.concat(morceaux), "r_egal": pd.concat(ew).fillna(0.0), "compositions": compos,
+            "rotation": float(np.mean(rot)) if rot else np.nan}
+
+
+def singes_modele(prix, secteurs, places, dates, n=26, cap_secteur=0.20, cap_place=0.30, n_singes=1000, graine=7):
+    """Le monde du hasard pour le portefeuille modèle : n_singes portefeuilles qui, aux mêmes dates, tirent au sort
+    le même nombre de titres dans le même univers éligible, avec les mêmes limites par secteur et par place, à poids égaux.
+    Renvoie la matrice des rendements quotidiens (jours × singes)."""
+    rng = np.random.default_rng(graine)
+    R = prix.pct_change(fill_method=None)
+    dates = sorted(dates) + [prix.index[-1]]
+    blocs = []
+    for d0, d1 in zip(dates[:-1], dates[1:]):
+        if d1 <= d0:
+            continue
+        sig = signaux_modele(prix, d0)
+        fen = R.loc[(R.index > d0) & (R.index <= d1)]
+        if sig.empty or fen.empty:
+            continue
+        elig = list(sig.index)
+        k = int(min(n, len(elig)))
+        max_s, max_p = max(1, int(np.floor(cap_secteur * k + 1e-9))), max(1, int(np.floor(cap_place * k + 1e-9)))
+        sec = [secteurs.get(t, "?") for t in elig]
+        pla = [places.get(t, "?") for t in elig]
+        S = np.zeros((n_singes, len(elig)))
+        for i in range(n_singes):
+            cs, cp, pris = {}, {}, 0
+            for j in rng.permutation(len(elig)):
+                if cs.get(sec[j], 0) >= max_s or cp.get(pla[j], 0) >= max_p:
+                    continue
+                S[i, j] = 1.0
+                cs[sec[j]], cp[pla[j]] = cs.get(sec[j], 0) + 1, cp.get(pla[j], 0) + 1
+                pris += 1
+                if pris == k:
+                    break
+            if pris:
+                S[i] /= pris
+        blocs.append(pd.DataFrame(fen[elig].fillna(0.0).values @ S.T, index=fen.index))
+    return pd.concat(blocs) if blocs else pd.DataFrame()
+
+
+def bilan_serie(r):
+    """Rendement annualisé, volatilité, Sharpe simple et plus forte baisse d'une série de rendements quotidiens."""
+    x = pd.Series(r).dropna()
+    if len(x) < 20:
+        return {"rend": np.nan, "vol": np.nan, "sharpe": np.nan, "baisse": np.nan, "total": np.nan}
+    v = (1 + x).cumprod()
+    an = v.iloc[-1] ** (252 / len(x)) - 1
+    vol = x.std(ddof=1) * np.sqrt(252)
+    return {"rend": float(an), "vol": float(vol), "sharpe": float(x.mean() / x.std(ddof=1) * np.sqrt(252)) if x.std(ddof=1) > 0 else np.nan,
+            "baisse": float((v / v.cummax() - 1).min()), "total": float(v.iloc[-1] - 1)}
+
+
+def confirmations_modele(r, r_egal, r_bench, singes, n_essais=10, n_boot=1000):
+    """Batterie de tests sur un portefeuille modèle. Chaque test répond à une question différente ; aucun ne suffit seul."""
+    out = {}
+    x = pd.Series(r).dropna()
+    # 1 et 2 : face au hasard (mêmes dates, même univers, mêmes règles)
+    if singes is not None and not singes.empty:
+        sg = singes.reindex(x.index).fillna(0.0)
+        tot = (1 + sg).prod() - 1
+        sh = sg.mean() / sg.std(ddof=1) * np.sqrt(252)
+        b = bilan_serie(x)
+        out["singes_total"], out["singes_sharpe"] = tot, sh
+        out["p_rendement"] = float((tot >= b["total"]).mean())
+        out["p_sharpe"] = float((sh >= b["sharpe"]).mean())
+    # 3 : alpha face à l'indice, bootstrap par blocs
+    if r_bench is not None:
+        bo = bootstrap_alpha(x, pd.Series(r_bench), n_boot=n_boot, longueur_bloc=5)
+        if bo:
+            out["alpha_an"], out["p_alpha"], out["beta"] = bo["alpha"] * 252, bo["p_boot"], bo["beta"]
+    # 4 : Sharpe dégonflé du nombre d'essais
+    ds = sharpe_degonfle(x, n_essais)
+    if ds:
+        out["dsr"], out["sr_seuil"] = ds["dsr"], ds["sr_seuil_annuel"]
+    # 5 : stabilité dans le temps, face à l'univers à poids égaux
+    z = pd.concat([x.rename("m"), pd.Series(r_egal).rename("e")], axis=1).dropna()
+    if len(z) > 60:
+        an = z.groupby(z.index.year).agg(lambda c: (1 + c).prod() - 1)
+        nb = z.groupby(z.index.year)["m"].count()
+        an = an[nb >= 60]
+        out["annees"] = an
+        out["part_annees"] = float((an["m"] > an["e"]).mean()) if len(an) else np.nan
+        moitie = len(z) // 2
+        out["moities"] = [float((1 + z["m"].iloc[:moitie]).prod() - (1 + z["e"].iloc[:moitie]).prod()),
+                          float((1 + z["m"].iloc[moitie:]).prod() - (1 + z["e"].iloc[moitie:]).prod())]
+    return out
+
+
+def stop_suiveur(prix, date_achat, vol_annuelle, k=2.5, plancher=0.08, plafond=0.30):
+    """Stop suiveur proportionnel à la volatilité du titre : la distance vaut k fois sa volatilité mensuelle
+    (bornée entre 8 % et 30 %), mesurée depuis le plus haut atteint depuis l'achat. Un stop fixe à 5 % se déclenche
+    sans arrêt sur un titre volatil ; un stop n'a d'intérêt que si les cours ont une tendance (Kaminski et Lo, 2014).
+    Renvoie le recul depuis le plus haut, le seuil, la date du plus haut et si le stop est touché."""
+    x = pd.Series(prix).dropna()
+    if date_achat is not None and pd.notna(date_achat):
+        x = x.loc[x.index >= pd.Timestamp(date_achat)]
+    if len(x) < 2 or vol_annuelle is None or pd.isna(vol_annuelle):
+        return None
+    seuil = float(np.clip(k * vol_annuelle / np.sqrt(12), plancher, plafond))
+    haut = x.max()
+    recul = float(x.iloc[-1] / haut - 1)
+    return {"recul": recul, "seuil": -seuil, "date_haut": x.idxmax(), "touche": recul <= -seuil}
+
+
+# ---------------------------------------------------------------- scénarios politiques (v9)
+def sensibilite_facteur(R, r_marche, facteur, fenetre=504):
+    """Pour chaque titre : r = a + b_marché × marché + b_facteur × facteur. Le facteur est un rendement relatif
+    (par exemple CAC 40 moins Europe) : b_facteur mesure ce que le titre gagne ou perd quand la France fait
+    1 point de mieux ou de moins bien que le reste de l'Europe, à marché européen inchangé."""
+    X = pd.DataFrame({"marche": r_marche, "facteur": facteur}).dropna().iloc[-fenetre:]
+    lignes = {}
+    for t in R.columns:
+        y = R[t].reindex(X.index)
+        ok = y.notna()
+        if ok.sum() < 120:
+            continue
+        reg = regression_multi(y[ok], X[ok])
+        if reg is None:
+            continue
+        lignes[t] = {"beta_marche": float(reg["betas"]["marche"]), "beta_facteur": float(reg["betas"]["facteur"]),
+                     "t_facteur": float(reg["t"]["facteur"]) if "t" in reg and "facteur" in reg["t"] else np.nan,
+                     "r2_adj": float(reg["r2_adj"]), "n": int(ok.sum())}
+    return pd.DataFrame(lignes).T
+
+
+def prix_binaire(p, choc, beta=1.0):
+    """Événement à deux issues déjà en partie dans les cours. Si le marché donne une probabilité p au scénario de tension
+    et que l'écart total de valeur entre les deux issues vaut « choc », alors le cours bouge de :
+    (1 − p) × choc si le scénario se réalise, − p × choc s'il est écarté, et de 0,10 × choc quand p monte de 10 points."""
+    p = float(np.clip(p, 0.0, 1.0))
+    return {"realise": (1 - p) * choc * beta, "ecarte": -p * choc * beta, "dix_points": 0.10 * choc * beta}
+
+
+def reaction_aux_cotes(facteur, proba):
+    """Le facteur réagit-il aux variations de la probabilité ? Régression du rendement quotidien du facteur sur la variation
+    quotidienne de la probabilité. La pente est l'écart total implicite entre les deux issues (le « choc »)."""
+    z = pd.DataFrame({"f": facteur, "dp": pd.Series(proba).diff()}).dropna()
+    z = z[z["dp"].abs() > 0]
+    if len(z) < 30 or z["dp"].var() == 0:
+        return None
+    reg = regression(z["f"], z["dp"])
+    if reg is None:
+        return None
+    return {"pente": float(reg["beta"]), "t": float(reg.get("t_beta", np.nan)), "r2": float(reg["r2"]), "n": int(len(z))}

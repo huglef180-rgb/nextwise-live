@@ -122,4 +122,70 @@ test("active share : copie = 0, aucun titre commun = 1, moitié commune = 0,5",
      and abs(A.active_share({"a": .5, "b": .5}, {"a": .5, "c": .5}) - 0.5) < 1e-12)
 test("active share : les poids sont ramenés à 100 % (cash ignoré)", abs(A.active_share({"a": .4, "b": .4}, {"a": 1, "b": 1})) < 1e-12)
 
+# v8 : portefeuille modèle
+_i = pd.bdate_range("2021-01-01", periods=900); _g = np.random.default_rng(42)
+_derive = np.linspace(-0.0006, 0.0010, 30)                     # titres 0 (pire) à 29 (meilleur), dérive constante
+_vols = np.tile([0.008, 0.012, 0.016], 10)
+_px = pd.DataFrame(np.exp(np.cumsum(_g.normal(_derive, _vols, (900, 30)), axis=0)), index=_i, columns=[f"T{k:02d}" for k in range(30)])
+_sec = {f"T{k:02d}": f"S{k % 6}" for k in range(30)}; _pla = {f"T{k:02d}": f"P{k % 4}" for k in range(30)}
+_sig = A.signaux_modele(_px, _i[600])
+_sig_fut = A.signaux_modele(_px.assign(T29=_px["T29"].where(_px.index <= _i[600], 999.0)), _i[600])
+test("modèle : les signaux n'utilisent aucune donnée postérieure à la date", _sig.equals(_sig_fut) and len(_sig) == 30)
+_tit, _sc = A.selection_modele(_sig, _sec, _pla, n=12, poids_signaux={"momentum": 1, "faible_vol": 0, "haut52": 0})
+from collections import Counter
+test("modèle : 12 titres, au plus 20 % par secteur et 30 % par place", len(_tit) == 12 and max(Counter(_sec[t] for t in _tit).values()) <= 2
+     and max(Counter(_pla[t] for t in _tit).values()) <= 3)
+test("modèle : le momentum retient des titres à dérive supérieure à la moyenne de l'univers", np.mean([int(t[1:]) for t in _tit]) > 14.5 + 1)
+_w = A.poids_modele(_px, _i[600], _tit, _sec, _pla, mode="mdp", borne=0.10)
+test("modèle : chaque ligne >= 1,5 %, somme 1, ligne <= 10 %, secteur <= 20 %", abs(_w.sum() - 1) < 1e-6 and _w.min() >= 0.015 - 1e-6 and _w.max() <= 0.10 + 1e-6
+     and max(_w.groupby([_sec[t] for t in _w.index]).sum()) <= 0.20 + 1e-4)
+_bt = A.backtest_modele(_px, _sec, _pla, n=12, poids_signaux={"momentum": 1, "faible_vol": 0, "haut52": 0}, mode="egal")
+test("modèle : sur des titres à dérive persistante, le momentum bat l'univers à poids égaux hors échantillon",
+     _bt is not None and (1 + _bt["r"]).prod() > (1 + _bt["r_egal"]).prod() and 0 <= _bt["rotation"] <= 1)
+_sg = A.singes_modele(_px, _sec, _pla, list(_bt["compositions"].keys()), n=12, n_singes=200)
+_cf = A.confirmations_modele(_bt["r"], _bt["r_egal"], _px.mean(axis=1).pct_change(), _sg, n_essais=5, n_boot=200)
+test("modèle : les singes couvrent les mêmes jours et le modèle les bat (p < 5 %)", _sg.shape == (len(_bt["r"]), 200) and _cf["p_rendement"] < 0.05)
+_pxh = pd.DataFrame(np.exp(np.cumsum(_g.normal(0.0002, 0.012, (900, 30)), axis=0)), index=_i, columns=_px.columns)   # aucun signal : pur hasard
+_bth = A.backtest_modele(_pxh, _sec, _pla, n=12, mode="egal")
+_cfh = A.confirmations_modele(_bth["r"], _bth["r_egal"], _pxh.mean(axis=1).pct_change(), A.singes_modele(_pxh, _sec, _pla, list(_bth["compositions"].keys()), n=12, n_singes=200), n_boot=200)
+test("modèle : sur des cours purement aléatoires, le test ne crie pas au talent (p > 5 %)", _cfh["p_rendement"] > 0.05 and _cfh["p_sharpe"] > 0.05)
+_b0 = pd.Series(_g.normal(0, 0.01, 2000)); _p0 = np.where(_b0 > 0, 1.3 * _b0, 0.6 * _b0) + _g.normal(0, 0.001, 2000)
+_rt, _ = A.ratios(pd.Series(_p0), _b0)
+_rt = _rt.set_index("ratio")["portefeuille"]
+test("bêta à la hausse 1,3 et bêta à la baisse 0,6 retrouvés", abs(_rt["Bêta à la hausse"] - 1.3) < 0.05 and abs(_rt["Bêta à la baisse"] - 0.6) < 0.05)
+
+_sx = pd.Series([100, 110, 120, 115, 100], index=pd.bdate_range("2026-10-01", periods=5))
+_st = A.stop_suiveur(_sx, "2026-10-01", 0.24)       # seuil = 2,5 × 24 % / √12 = 17,3 %
+test("stop suiveur : recul de 16,7 % depuis le plus haut, seuil 17,3 %, pas encore touché", abs(_st["recul"] + 1/6) < 1e-9 and abs(_st["seuil"] + 0.1732) < 1e-3 and not _st["touche"])
+test("stop suiveur : même recul avec 20 % de volatilité (seuil 14,4 %) -> touché ; seuil borné à 8 % et 30 %",
+     A.stop_suiveur(_sx, "2026-10-01", 0.20)["touche"] and abs(A.stop_suiveur(_sx, None, 0.05)["seuil"] + 0.08) < 1e-9 and abs(A.stop_suiveur(_sx, None, 0.90)["seuil"] + 0.30) < 1e-9)
+
+_ia = pd.bdate_range("2024-01-01", periods=400); _ga = np.random.default_rng(5)
+_ma = _ga.normal(0.0003, 0.01, 400)
+_bh = np.array([1.4, 1.0, 0.7, 1.0, 1.2, 0.9, 1.1, 0.8]); _bb = np.array([0.6, 1.0, 1.3, 1.0, 0.8, 1.1, 0.9, 1.2])   # la moyenne de l'univers garde un bêta de 1
+_ra = np.where(_ma[:, None] > 0, _ma[:, None] * _bh, _ma[:, None] * _bb) + _ga.normal(0, 0.002, (400, 8))
+_pa = pd.DataFrame(np.exp(np.cumsum(_ra, axis=0)), index=_ia, columns=list("ABCDEFGH"))
+_as = A.signaux_modele(_pa, _ia[-1])["asym_beta"]
+test("asymétrie de bêta : A (1,4 / 0,6) la plus forte, C (0,7 / 1,3) la plus faible, valeurs proches de +0,8 et −0,6",
+     _as.idxmax() == "A" and _as.idxmin() == "C" and abs(_as["A"] - 0.8) < 0.15 and abs(_as["C"] + 0.6) < 0.15)
+_ce = np.array([[0.04, 0.01, 0.0], [0.01, 0.09, 0.02], [0.0, 0.02, 0.16]]); _we = A.optimiser(_ce, "erc", 1.0); _rc = _we * (_ce @ _we)
+test("parité de risque (gradient exact) : les trois contributions au risque sont égales", np.ptp(_rc) / _rc.mean() < 1e-3 and abs(_we.sum() - 1) < 1e-9)
+
+# v9 : scénarios politiques
+_ip = pd.bdate_range("2024-01-01", periods=600); _gp = np.random.default_rng(9)
+_mk = pd.Series(_gp.normal(0.0003, 0.009, 600), _ip); _fa = pd.Series(_gp.normal(0, 0.004, 600), _ip)
+_Rp = pd.DataFrame({"FR": 1.0 * _mk + 1.5 * _fa + _gp.normal(0, 0.003, 600), "EU": 0.8 * _mk + 0.0 * _fa + _gp.normal(0, 0.003, 600)}, index=_ip)
+_sf = A.sensibilite_facteur(_Rp, _mk, _fa)
+test("sensibilité au facteur France : 1,5 retrouvé pour le titre exposé (t élevé), 0 pour l'autre",
+     abs(_sf.loc["FR", "beta_facteur"] - 1.5) < 0.1 and _sf.loc["FR", "t_facteur"] > 10 and abs(_sf.loc["EU", "beta_facteur"]) < 0.1 and abs(_sf.loc["EU", "beta_marche"] - 0.8) < 0.05)
+_pb = A.prix_binaire(0.30, -0.10, 1.0)
+test("événement à deux issues : p = 30 %, écart −10 % -> −7 % si réalisé, +3 % si écarté, −1 % pour 10 points de plus ; espérance nulle",
+     abs(_pb["realise"] + 0.07) < 1e-12 and abs(_pb["ecarte"] - 0.03) < 1e-12 and abs(_pb["dix_points"] + 0.01) < 1e-12
+     and abs(0.30 * _pb["realise"] + 0.70 * _pb["ecarte"]) < 1e-12)
+_pr = pd.Series(np.clip(0.3 + np.cumsum(_gp.normal(0, 0.01, 600)), 0.02, 0.98), _ip)
+_fr = -0.08 * _pr.diff().fillna(0) + pd.Series(_gp.normal(0, 0.0005, 600), _ip)
+_rc = A.reaction_aux_cotes(_fr, _pr); _rc0 = A.reaction_aux_cotes(pd.Series(_gp.normal(0, 0.004, 600), _ip), _pr)
+test("réaction aux cotes : écart implicite de −8 % retrouvé, et aucun lien détecté sur un facteur indépendant",
+     abs(_rc["pente"] + 0.08) < 0.01 and abs(_rc["t"]) > 5 and abs(_rc0["t"]) < 3)
+
 print("\nTOUS LES TESTS PASSENT" if ok else "\nAU MOINS UN TEST ÉCHOUE")
