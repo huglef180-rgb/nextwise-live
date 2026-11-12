@@ -3272,25 +3272,36 @@ def page_politique():
         "sur les issues peu probables et les marchés peu liquides. L'effet du risque politique sur les cours est documenté par Pástor et Veronesi (2013) et Kelly, Pástor et Veronesi (2016).")
 
 # ================================================================== PORTEFEUILLE MODÈLE
+OR_TICKER = "GOLD.PA"   # Amundi Physical Gold (ETC coté à Paris, en euros)
 MODES_MODELE = {"Diversification maximale": "mdp", "Variance minimale": "minvar", "Parité de risque": "erc", "Poids égaux": "egal"}
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Test hors échantillon du portefeuille modèle…")
-def modele_backtest_cache(prix, sect, plac, n, ps, mode, borne):
-    return A.backtest_modele(prix, dict(sect), dict(plac), n, dict(ps), mode, borne)
+def modele_backtest_cache(prix, sect, plac, n, ps, mode, borne, forces=()):
+    return A.backtest_modele(prix, dict(sect), dict(plac), n, dict(ps), mode, borne, forces=list(forces))
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Sélection refaite sur 200 scénarios de l'année écoulée…")
+def modele_robustesse_cache(prix, sect, plac, n, ps, mode, borne, forces=()):
+    return A.robustesse_modele(prix, prix.index[-1], dict(sect), dict(plac), n, dict(ps), mode, borne, list(forces), n_scen=200)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Simulation de 5 000 trajectoires jusqu'à la fin du concours…")
+def modele_horizon_cache(rendements, jours, centrer):
+    return A.simulation_horizon(rendements, jours, n_sim=5000, centrer_sur="Euronext 100" if centrer else None)
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Comparaison des quatre pondérations…")
-def modele_ponderations_cache(prix, sect, plac, n, ps, borne):
+def modele_ponderations_cache(prix, sect, plac, n, ps, borne, forces=()):
     """Les quatre pondérations côte à côte : risque prévu aujourd'hui et résultat hors échantillon."""
     sig = A.signaux_modele(prix, prix.index[-1])
-    titres, _ = A.selection_modele(sig, dict(sect), dict(plac), n, dict(ps))
+    titres, _ = A.selection_modele(sig, dict(sect), dict(plac), n, dict(ps), forces=list(forces))
     cov = prix[titres].pct_change(fill_method=None).iloc[-252:].cov().values * 252
     lignes = []
     for lib, m in MODES_MODELE.items():
         w = A.poids_modele(prix, prix.index[-1], titres, dict(sect), dict(plac), m, borne).values
         v = float(np.sqrt(w @ cov @ w))
-        bt = modele_backtest_cache(prix, sect, plac, n, ps, m, borne)
+        bt = modele_backtest_cache(prix, sect, plac, n, ps, m, borne, forces)
         b = A.bilan_serie(bt["r"]) if bt else {"rend": np.nan, "vol": np.nan, "sharpe": np.nan, "baisse": np.nan}
         lignes.append({"ponderation": lib, "mode": m, "vol_prev": v, "dr": float(w @ np.sqrt(np.diag(cov)) / v) if v > 0 else np.nan,
                        "hhi": float((w ** 2).sum()), "max": float(w.max()), "rend": b["rend"], "vol": b["vol"], "sharpe": b["sharpe"], "baisse": b["baisse"]})
@@ -3308,7 +3319,7 @@ def modele_confirm_cache(r, r_egal, r_bench, singes, n_essais):
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Variantes du modèle (autres réglages)…")
-def modele_variantes_cache(prix, sect, plac, n, ps, mode, borne):
+def modele_variantes_cache(prix, sect, plac, n, ps, mode, borne, forces=()):
     base = dict(ps)
     var = [(f"{max(8, n - 6)} lignes", dict(n=max(8, n - 6))), (f"{n + 6} lignes", dict(n=n + 6))]
     var += [(f"Pondération : {lib.lower()}", dict(mode=m)) for lib, m in MODES_MODELE.items() if m != mode and m != "erc"]
@@ -3321,7 +3332,7 @@ def modele_variantes_cache(prix, sect, plac, n, ps, mode, borne):
     for nom, ch in var:
         if "ps" in ch and {k: v for k, v in ch["ps"].items() if v} == {k: v for k, v in base.items() if v}:
             continue
-        bt = A.backtest_modele(prix, dict(sect), dict(plac), ch.get("n", n), ch.get("ps", base), ch.get("mode", mode), borne)
+        bt = A.backtest_modele(prix, dict(sect), dict(plac), ch.get("n", n), ch.get("ps", base), ch.get("mode", mode), borne, forces=list(forces))
         if bt is None:
             continue
         m, e = A.bilan_serie(bt["r"]), A.bilan_serie(bt["r_egal"])
@@ -3330,11 +3341,11 @@ def modele_variantes_cache(prix, sect, plac, n, ps, mode, borne):
 
 
 def page_modele():
-    st.subheader("Portefeuille modèle : une proposition purement quantitative, puis des confirmations")
-    intro("Le site construit un portefeuille sans aucun jugement : il classe les titres de l'univers avec des signaux qui résistent aux études de "
-          "réplication, puis fixe les poids sur le risque seul, avec les limites du concours. Ensuite, une batterie de tests vérifie si ce modèle "
-          "aurait vraiment marché <b>hors échantillon</b>, ou s'il a seulement eu de la chance. "
-          "<b>Ce n'est pas un pilote automatique</b> : c'est une source d'idées, à n'étudier en profondeur que si les confirmations sont là.")
+    st.subheader("Portefeuille modèle : un fil conducteur en quatre étapes")
+    intro("Le site construit un portefeuille <b>sans aucun jugement</b>, puis te fait suivre un ordre strict : "
+          "<b>1.</b> construire et vérifier que la sélection est solide ; <b>2.</b> simuler ce que les prochains mois peuvent donner ; "
+          "<b>3.</b> tester si le modèle se distingue du hasard ; <b>4.</b> seulement si c'est convaincant, approfondir titre par titre avec les autres pages. "
+          "<b>Ce n'est pas un pilote automatique</b> : un modèle plus poussé ne devine pas l'avenir, il évite seulement de se fier à un accident des données.")
     # Un formulaire : on règle tout, puis un seul calcul. Sans lui, chaque curseur déplacé relançait le test complet.
     with st.form("mod_reglages", border=False):
         c = st.columns([1.2, 1, 1.2, 1])
@@ -3354,6 +3365,10 @@ def page_modele():
                                        help="Bêta les jours de hausse moins bêta les jours de baisse, face à la moyenne de l'univers. Un titre qui monte plus qu'il ne baisse "
                                             "avec le marché a une asymétrie positive. Signal très bruité (chaque bêta repose sur la moitié des séances) : il est à 0 par défaut. "
                                             "Active-le et laisse les confirmations dire s'il apporte quelque chose.")}
+        avec_or = st.toggle("Inclure l'or (Amundi Physical Gold, GOLD.PA) dans le portefeuille", key="mod_or",
+                            help="L'or n'est pas choisi pour son score : il est imposé comme amortisseur, parce qu'il ne suit pas les actions. "
+                                 "C'est la pondération (fondée sur le risque) qui décide de son poids, dans la limite du poids maximal par ligne. "
+                                 "Dans le test sur le passé, il n'entre qu'à partir du moment où il a un an de cours.")
         st.form_submit_button("Appliquer les réglages", type="primary",
                               help="Règle tout ce que tu veux, puis clique une seule fois : le test hors échantillon ne se relance qu'à ce moment-là.")
     if sum(ps.values()) == 0:
@@ -3365,6 +3380,15 @@ def page_modele():
         # jours sans cotation (lignes créées par les devises la nuit, jours fériés) : sans ce nettoyage, aucun titre n'a de cours « aujourd'hui »
         pu = A.nettoyer_prix(pu)
         pu = pu.loc[:, pu.notna().sum() > 0]
+    forces = ()
+    if avec_or and pu is not None and not pu.empty:
+        _, ag = historique((OR_TICKER,))
+        if ag is not None and OR_TICKER in ag.columns and ag[OR_TICKER].notna().sum() > 300:
+            pu = pu.join(ag[OR_TICKER].reindex(pu.index.union(ag.index)).ffill(limit=5).reindex(pu.index).rename(OR_TICKER), how="left")
+            u = pd.concat([u, pd.DataFrame({"nom": "Or physique (Amundi)", "secteur": "Or", "place": "Paris", "univers": "liste"}, index=[OR_TICKER])])
+            forces = (OR_TICKER,)
+        else:
+            st.warning("Les cours de l'or (GOLD.PA) ne sont pas disponibles pour l'instant : le portefeuille est construit sans lui.")
     if pu is None or pu.empty or len(pu) < 300:
         st.info("Historique de l'univers indisponible pour l'instant.")
         return
@@ -3372,12 +3396,23 @@ def page_modele():
     plac = tuple(sorted((t, str(u.loc[t, "place"])) for t in pu.columns))
     ps_t = tuple(sorted(ps.items()))
     essais = st.session_state.setdefault("mod_essais", set())
-    essais.add((large, n, mode, borne, ps_t))
+    cle_reglages = (large, n, mode, borne, ps_t, forces)
+    essais.add(cle_reglages)
+    etat = st.session_state
+    barre = st.empty()          # remplie en fin de page, une fois connus les boutons cliqués pendant ce passage
+    pastille = lambda num, nom, ok: (f'<div style="flex:1;min-width:150px;padding:9px 12px;border-radius:10px;border:1px solid rgba(128,128,128,.25);'
+                                     f'background:{"rgba(34,197,94,.10)" if ok else "rgba(128,128,128,.05)"}"><span style="font-weight:700">{num}</span> · {nom}'
+                                     f'<div style="font-size:.74rem;opacity:.7">{"fait" if ok else "à faire"}</div></div>')
+    def dessine_barre(ouverte=False):
+        barre.html('<div style="display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 6px">' + pastille(1, "Construire", etat.get("mod_sol") == cle_reglages)
+                   + pastille(2, "Simuler la suite", etat.get("mod_sim") == cle_reglages) + pastille(3, "Tester la chance", etat.get("mod_lance") == cle_reglages)
+                   + pastille(4, "Approfondir", ouverte) + "</div>")
+    dessine_barre()
 
     # ---------- 1. la proposition du jour
-    st.markdown("### 1. Le portefeuille proposé aujourd'hui")
+    st.markdown("### Étape 1 · Construire le portefeuille")
     sig = A.signaux_modele(pu, pu.index[-1])
-    titres, score = A.selection_modele(sig, dict(sect), dict(plac), n, ps)
+    titres, score = A.selection_modele(sig, dict(sect), dict(plac), n, ps, forces=list(forces))
     if len(titres) < 3:
         st.info("Pas assez de titres avec un an d'historique pour construire le modèle.")
         return
@@ -3397,7 +3432,7 @@ def page_modele():
     kpi(c[0], "Volatilité prévue", pct(vol_p, 1), "sur un an de cours", delta_color="off")
     kpi(c[1], "Ratio de diversification", f"{dr:.2f}".replace(".", ","), f"{dr ** 2:.1f} paris indépendants".replace(".", ","), delta_color="off")
     kpi(c[2], "HHI", pct(h_, 1), f"{n_eff:.1f} lignes effectives".replace(".", ","), delta_color="off")
-    kpi(c[3], "Secteurs couverts", f"{prop['secteur'].nunique()} sur 11", f"plus gros : {pct(prop.groupby('secteur')['poids'].sum().max(), 0)}", delta_color="off")
+    kpi(c[3], "Secteurs couverts", f"{prop.loc[prop['secteur'] != 'Or', 'secteur'].nunique()} sur 11", f"plus gros : {pct(prop.groupby('secteur')['poids'].sum().max(), 0)}", delta_color="off")
     kpi(c[4], "En commun avec toi", f"{len(communs)} titres", f"sur {len(titres)} dans le modèle", delta_color="off")
     tableau(prop.style.format({"poids": lambda v: pct(v, 1), "score": lambda v: f"{v:+.2f}".replace(".", ","), "momentum": lambda v: pct(v, 0, True),
                                "vol": lambda v: pct(v, 0), "asym": lambda v: "—" if pd.isna(v) else f"{v:+.2f}".replace(".", ","),
@@ -3419,152 +3454,316 @@ def page_modele():
         st.markdown(f"**Chez toi, pas dans le modèle ({len(absents)})** : pas une raison de vendre, mais des lignes que seuls tes arguments justifient.")
         st.caption(", ".join(str(pf.loc[t, "nom"]) for t in absents) if absents else "aucune")
 
-    # ---------- 2. test hors échantillon
-    st.markdown("### 2. Ce modèle aurait-il marché ? Le test hors échantillon")
-    intro("À chaque fin de mois du passé, le site reconstruit le portefeuille avec <b>les seules données connues ce jour-là</b>, le détient un mois, "
-          "puis recommence. Aucun réglage n'a vu le futur. La référence honnête est l'<b>univers à poids égaux</b> : mêmes titres, aucun choix.")
-    bt = modele_backtest_cache(pu, sect, plac, n, ps_t, mode, borne)
-    if bt is None or len(bt["r"]) < 120:
-        st.info("Historique trop court pour un test hors échantillon (il faut au moins un an et demi de cours).")
-        return
-    r_m, r_e = bt["r"], bt["r_egal"]
-    r_b = bu.pct_change(fill_method=None).reindex(r_m.index).fillna(0.0) if bu is not None else None
-    bm, be = A.bilan_serie(r_m), A.bilan_serie(r_e)
-    bb = A.bilan_serie(r_b) if r_b is not None else None
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=r_m.index, y=(1 + r_m).cumprod() - 1, name="Portefeuille modèle", line=dict(width=2.4, color=PALETTE[0])))
-    fig.add_trace(go.Scatter(x=r_e.index, y=(1 + r_e).cumprod() - 1, name="Univers à poids égaux", line=dict(width=1.8, color=PALETTE[2])))
-    if r_b is not None:
-        fig.add_trace(go.Scatter(x=r_b.index, y=(1 + r_b).cumprod() - 1, name="Euronext 100", line=dict(width=1.6, color=PALETTE[6], dash="dot")))
-    fig.update_layout(height=340, yaxis_tickformat="+.0%", margin=dict(t=10, l=0, r=0, b=0), legend=dict(orientation="h", y=-0.15), hovermode="x unified")
-    graphe(fig, key="mod_bt")
-    c = st.columns(5)
-    kpi(c[0], "Rendement annualisé", pct(bm["rend"], 1, True), f"poids égaux {pct(be['rend'], 1, True)}", delta_color="off")
-    kpi(c[1], "Volatilité", pct(bm["vol"], 1), f"poids égaux {pct(be['vol'], 1)}", delta_color="off")
-    kpi(c[2], "Ratio de Sharpe", f"{bm['sharpe']:.2f}".replace(".", ","), f"poids égaux {be['sharpe']:.2f}".replace(".", ","), delta_color="off")
-    kpi(c[3], "Plus forte baisse", pct(bm["baisse"], 0), f"poids égaux {pct(be['baisse'], 0)}", delta_color="off")
-    kpi(c[4], "Rotation mensuelle", pct(bt["rotation"], 0) if pd.notna(bt["rotation"]) else "—", "part du portefeuille renouvelée", delta_color="off")
-    st.caption(f"Du {r_m.index.min():%d/%m/%Y} au {r_m.index.max():%d/%m/%Y}, {len(bt['compositions'])} reconstructions mensuelles. "
-               "Attention : l'univers est celui d'aujourd'hui (les titres disparus ou déclassés n'y sont pas), donc tous les rendements absolus sont trop flatteurs. "
-               "C'est pour cela que le modèle est jugé face à l'univers à poids égaux et aux tirages au hasard, qui profitent du même biais.")
+    # ---------- 1 bis. solidité de la sélection
+    st.markdown("**La sélection est-elle solide ?**")
+    st.caption("Le classement repose sur une seule année de cours. Si cette année s'était déroulée un peu autrement, aurait-on choisi les mêmes titres ? "
+               "Le site remélange 200 fois les mois de l'année écoulée (les mêmes jours pour tous les titres) et refait la sélection à chaque fois (Michaud, 1998).")
+    if st.button("Tester la solidité sur 200 scénarios", key="mod_sol_go"):
+        etat["mod_sol"] = cle_reglages
+    rob = None
+    if etat.get("mod_sol") == cle_reglages:
+        rob = modele_robustesse_cache(pu, sect, plac, n, ps_t, mode, borne, forces)
+    if rob is not None:
+        fr = rob["frequence"]
+        libres = [t for t in titres if t not in forces]
+        solides, fragiles = [t for t in libres if fr.get(t, 0) >= 0.8], [t for t in libres if fr.get(t, 0) < 0.5]
+        stab = float(fr.reindex(libres).mean()) if libres else np.nan
+        c = st.columns(4)
+        kpi(c[0], "Stabilité de la sélection", pct(stab, 0), "fréquence moyenne des titres retenus", delta_color="off")
+        kpi(c[1], "Titres solides", f"{len(solides)} sur {len(libres)}", "retenus dans 80 % des scénarios ou plus", delta_color="off")
+        kpi(c[2], "Titres fragiles", f"{len(fragiles)}", "retenus dans moins d'un scénario sur deux", delta_color="off")
+        ecart_w = float((rob["poids_moyens"].reindex(titres) - w.reindex(titres)).abs().sum() / 2)
+        kpi(c[3], "Poids déplacés par les scénarios", pct(ecart_w, 0), "part du portefeuille qui change", delta_color="off")
+        ts = pd.DataFrame({"nom": u["nom"].reindex(titres), "freq": fr.reindex(titres), "poids": w.reindex(titres),
+                           "poids_moy": rob["poids_moyens"].reindex(titres), "disp": rob["poids_ecart"].reindex(titres)}).sort_values("freq")
+        ts["avis"] = ["Imposé" if t in forces else ("Solide" if f_ >= 0.8 else ("Fragile" if f_ < 0.5 else "Moyen")) for t, f_ in ts["freq"].items()]
+        g, d = st.columns([3, 2])
+        with g:
+            fig = go.Figure(go.Bar(x=ts["freq"], y=ts["nom"], orientation="h",
+                                   marker_color=[C_NEUTRE if a_ == "Imposé" else (C_BON if a_ == "Solide" else (C_MAUVAIS if a_ == "Fragile" else C_ATTENTION)) for a_ in ts["avis"]],
+                                   hovertemplate="%{y} : retenu dans %{x:.0%} des scénarios<extra></extra>"))
+            fig.add_vline(x=0.8, line_dash="dot", line_color=C_NEUTRE); fig.add_vline(x=0.5, line_dash="dot", line_color=C_NEUTRE)
+            fig.update_layout(height=max(320, 19 * len(ts)), margin=dict(t=36, l=0, r=10, b=0), xaxis_tickformat=".0%", xaxis_range=[0, 1.02],
+                              title=dict(text="Fréquence de sélection de chaque titre retenu", font_size=13))
+            graphe(fig, key="mod_sol")
+        with d:
+            rempl = fr.drop(index=[t for t in titres if t in fr.index]).sort_values(ascending=False).head(6)
+            rempl = rempl[rempl > 0.2]
+            st.markdown("**Les remplaçants** : absents de la sélection, mais souvent retenus dans les scénarios.")
+            if len(rempl):
+                tableau(pd.DataFrame({"nom": u["nom"].reindex(rempl.index), "freq": rempl.values}, index=rempl.index).style.format({"freq": lambda v: pct(v, 0)}),
+                        hide_index=True, column_config={"nom": "Titre", "freq": "Fréquence de sélection"})
+            else:
+                st.caption("Aucun titre écarté ne revient souvent : la frontière de la sélection est nette.")
+            st.markdown("**Les fragiles** : " + (", ".join(str(u["nom"].get(t, t)) for t in fragiles) if fragiles else "aucun") + ".")
+        if stab >= 0.75 and ecart_w <= 0.15:
+            st.success(f"Sélection solide : en moyenne, un titre retenu l'est dans {pct(stab, 0)} des scénarios, et les poids bougent peu.")
+        elif stab >= 0.6:
+            st.warning(f"Sélection moyennement solide ({pct(stab, 0)}). Les titres « fragiles » doivent leur place à quelques semaines de cours : ne t'y attache pas.")
+        else:
+            st.error(f"Sélection fragile ({pct(stab, 0)}) : avec une année à peine différente, on aurait choisi un autre portefeuille. Les signaux retenus séparent mal les titres.")
+        st.caption("Limite : remélanger les mois garde les mêmes rendements d'ensemble ; le test mesure la sensibilité au calendrier et aux semaines extrêmes, "
+                   "pas ce qui se passerait dans une année réellement différente.")
 
-    st.markdown("**Les quatre pondérations côte à côte**")
-    if st.toggle("Comparer les quatre pondérations (trois tests de plus : compte une à deux minutes)", key="mod_cmp"):
-        cmp_ = modele_ponderations_cache(pu, sect, plac, n, ps_t, borne).sort_values("vol_prev")
-        tableau(cmp_.drop(columns="mode").style.format({"vol_prev": lambda v: pct(v, 1), "dr": lambda v: f"{v:.2f}".replace(".", ","), "hhi": lambda v: pct(v, 1),
-                                                        "max": lambda v: pct(v, 1), "rend": lambda v: pct(v, 1, True), "vol": lambda v: pct(v, 1),
-                                                        "sharpe": lambda v: f"{v:.2f}".replace(".", ","), "baisse": lambda v: pct(v, 0)})
-                .apply(lambda r_: ["font-weight:700" if r_["ponderation"] == lib_mode else "" for _ in r_], axis=1),
-                hide_index=True, column_config={"ponderation": "Pondération", "vol_prev": "Vol. prévue", "dr": "Diversif.", "hhi": "HHI",
-                                                "max": "Poids max", "rend": "Rendement", "vol": "Volatilité",
-                                                "sharpe": "Sharpe", "baisse": "Baisse max"})
-        st.caption("Du moins risqué au plus risqué, pour les mêmes titres. Les quatre premières colonnes (volatilité prévue, ratio de diversification, HHI, poids maximal) "
-                   "décrivent le portefeuille d'aujourd'hui ; les quatre suivantes (rendement annualisé, volatilité, Sharpe, plus forte baisse) viennent du test hors échantillon. En gras : la pondération sélectionnée. Choisis d'abord sur le risque et sur les critères du concours (ratio de diversification, HHI) : "
-                   "le rendement passé est la colonne la moins fiable, et retenir la pondération au meilleur Sharpe compte comme un réglage de plus.")
+    # ---------- 2. simuler la suite
+    st.markdown("### Étape 2 · Simuler la suite jusqu'à la fin du concours")
+    intro("Des milliers de trajectoires possibles, fabriquées en remettant bout à bout des morceaux de deux semaines tirés des trois dernières années. "
+          "Le modèle, ton portefeuille et l'indice reçoivent <b>les mêmes jours</b> : on compare donc leur comportement dans les mêmes mondes. "
+          "C'est une mesure de <b>dispersion</b>, pas une prévision.")
+    c = st.columns([1, 2])
+    fin = c[0].date_input("Fin du concours", dt.date(2027, 4, 30), key="mod_fin", format="DD/MM/YYYY",
+                          help="Vérifie la date exacte dans le règlement : elle fixe le nombre de séances simulées.")
+    hyp = c[1].radio("Hypothèse de rendement", ["Aucun avantage : tout le monde a le rendement moyen de l'indice", "Rendements passés de chacun"], key="mod_hyp",
+                     help="Le modèle choisit des titres qui ont bien marché : rejouer leurs rendements passés le flatte forcément. "
+                          "Avec « aucun avantage », seuls le risque et la diversification distinguent les portefeuilles : c'est l'hypothèse honnête.")
+    if st.button("Lancer la simulation", key="mod_sim_go"):
+        etat["mod_sim"] = cle_reglages
+    if etat.get("mod_sim") == cle_reglages:
+        jours_h = int(np.busday_count(dt.datetime.now(TZ).date(), fin))
+        Rm = pu[titres].pct_change(fill_method=None).iloc[-756:]
+        ok_c = [t for t in titres if Rm[t].notna().sum() > 250]
+        wm = w.reindex(ok_c) / w.reindex(ok_c).sum()
+        series = {"Portefeuille modèle": Rm[ok_c].fillna(0.0) @ wm}
+        miens = [t for t in pf.index if t in adj_eur.columns]
+        if miens and float(poids.reindex(miens).sum()) > 0:
+            Rt = A.nettoyer_prix(adj_eur[miens]).pct_change(fill_method=None).reindex(Rm.index)
+            series["Ton portefeuille"] = Rt.fillna(0.0) @ poids.reindex(miens).fillna(0.0)
+        if bu is not None:
+            series["Euronext 100"] = bu.ffill().pct_change(fill_method=None).reindex(Rm.index).fillna(0.0)
+        Rs = pd.DataFrame(series).iloc[1:]
+        centrer = hyp.startswith("Aucun") and "Euronext 100" in Rs.columns
+        sim = modele_horizon_cache(Rs, jours_h, centrer) if jours_h >= 5 else None
+        if sim is None:
+            st.info("Simulation impossible : il faut au moins cinq séances avant la date de fin et six mois d'historique.")
+        else:
+            tot, creux = sim
+            ref = "Euronext 100" if "Euronext 100" in tot.columns else None
+            lignes_s = []
+            for nom_ in tot.columns:
+                lignes_s.append({"ptf": nom_, "p5": float(tot[nom_].quantile(0.05)), "med": float(tot[nom_].median()), "p95": float(tot[nom_].quantile(0.95)),
+                                 "perte": float((tot[nom_] < 0).mean()), "creux": float(creux[nom_].median()),
+                                 "bat": float((tot[nom_] > tot[ref]).mean()) if ref and nom_ != ref else np.nan})
+            g, d = st.columns([3, 2])
+            with g:
+                fig = go.Figure()
+                for k_, nom_ in enumerate(tot.columns):
+                    fig.add_trace(go.Box(x=tot[nom_].clip(tot[nom_].quantile(0.005), tot[nom_].quantile(0.995)), name=nom_, boxpoints=False,
+                                         marker_color=[PALETTE[0], PALETTE[1], PALETTE[6]][k_ % 3], hoverinfo="x"))
+                fig.add_vline(x=0, line_color=C_NEUTRE, line_width=1)
+                fig.update_layout(height=280, margin=dict(t=36, l=0, r=10, b=0), xaxis_tickformat="+.0%", showlegend=False,
+                                  title=dict(text=f"Rendement possible sur {jours_h} séances (boîte : la moitié centrale des trajectoires)", font_size=13))
+                graphe(fig, key="mod_sim")
+            with d:
+                if "Ton portefeuille" in tot.columns:
+                    kpi(st, "Le modèle finit devant toi dans", pct(float((tot["Portefeuille modèle"] > tot["Ton portefeuille"]).mean()), 0),
+                        "des trajectoires (50 % = pile ou face)", delta_color="off")
+                    e5 = float(tot["Portefeuille modèle"].quantile(0.05) - tot["Ton portefeuille"].quantile(0.05))
+                    kpi(st, "Écart dans le mauvais cas", f"{e5 * 100:+.1f} pt".replace(".", ","), "modèle moins toi, au 5e centile", delta_color="off")
+            tableau(pd.DataFrame(lignes_s).style.format({"p5": lambda v: pct(v, 1, True), "med": lambda v: pct(v, 1, True), "p95": lambda v: pct(v, 1, True),
+                                                         "perte": lambda v: pct(v, 0), "creux": lambda v: pct(v, 1), "bat": lambda v: "—" if pd.isna(v) else pct(v, 0)})
+                    .map(signe_couleur, subset=["p5", "med", "p95"]),
+                    hide_index=True, column_config={"ptf": "Portefeuille", "p5": "Mauvais cas (1 sur 20)", "med": "Cas médian", "p95": "Bon cas (1 sur 20)",
+                                                    "perte": "Risque de finir en perte", "creux": "Baisse en cours de route", "bat": "Bat l'indice"})
+            st.caption(("Hypothèse « aucun avantage » : tous ont le même rendement moyen par jour. Le cas médian d'un portefeuille plus calme ressort quand même un peu plus haut : "
+                        "à rendement moyen égal, la volatilité ronge le résultat composé. Regarde surtout le mauvais cas et la baisse en cours de route. " if centrer else
+                        "Hypothèse « rendements passés » : le modèle est flatté, puisqu'il a choisi ses titres sur ces mêmes rendements. Ne retiens que l'écart de dispersion. ")
+                       + "Limites : les trois dernières années ne contiennent pas toutes les crises possibles, et les poids sont supposés fixes.")
+            cm = stress(w, pu, None)
+            ct = stress(poids, adj_eur, BENCH_PRINCIPAL)
+            if len(cm):
+                cr = cm.rename(columns={"portefeuille": "modele"})[["scenario", "modele", "couverture"]]
+                if len(ct):
+                    cr = cr.merge(ct.rename(columns={"portefeuille": "toi", "reference": "indice"})[["scenario", "toi", "indice"]], on="scenario", how="left")
+                cols_c = [c_ for c_ in ["modele", "toi", "indice"] if c_ in cr.columns]
+                st.markdown("**Et si une crise passée se reproduisait ?**")
+                tableau(cr[["scenario"] + cols_c + ["couverture"]].style.format({c_: (lambda v: "—" if pd.isna(v) else pct(v, 1, True)) for c_ in cols_c} | {"couverture": lambda v: pct(v, 0)})
+                        .map(signe_couleur, subset=cols_c),
+                        hide_index=True, column_config={"scenario": "Crise rejouée", "modele": "Portefeuille modèle", "toi": "Ton portefeuille actuel",
+                                                        "indice": "Euronext 100", "couverture": "Poids couvert"})
+                st.caption("Les poids d'aujourd'hui appliqués aux cours de l'époque. « Poids couvert » concerne le modèle : la part de ses titres déjà cotés à ce moment-là.")
 
-    # ---------- 3. confirmations
-    st.markdown("### 3. La batterie de confirmations")
-    intro("Chaque test pose une question différente. Un seul test réussi ne prouve rien ; c'est leur accord qui compte. "
-          "Le calcul prend environ une minute la première fois.")
-    n_conf = len(essais)
-    cle_reglages = (large, n, mode, borne, ps_t)
-    if st.button("Lancer les confirmations", type="primary", key="mod_go"):
-        st.session_state["mod_lance"] = cle_reglages
-    if st.session_state.get("mod_lance") != cle_reglages:
-        if st.session_state.get("mod_lance"):
-            st.caption("Les réglages ont changé : relance les confirmations pour ce nouveau modèle.")
-        return
-    singes = modele_singes_cache(pu, sect, plac, tuple(bt["compositions"].keys()), n)
-    variantes = modele_variantes_cache(pu, sect, plac, n, ps_t, mode, borne)
-    n_essais = n_conf + len(variantes) + 3          # + les trois autres pondérations du tableau comparatif
-    cf = modele_confirm_cache(r_m, r_e, r_b, singes, n_essais)
-    X = pd.DataFrame({"Marché": r_b}) if r_b is not None else pd.DataFrame(index=r_m.index)
-    wml, bv = wml_cache(pu), bv_cache(pu)
-    if len(wml) > 60:
-        X["Momentum"] = wml
-    if len(bv) > 60:
-        X["Basse volatilité"] = bv
-    fac = A.regression_multi(r_m, X) if X.shape[1] else None
+    def _etape_chance():
+        # ---------- 2. test hors échantillon
+        st.markdown("### Étape 3 · Tester la chance : ce modèle aurait-il marché ?")
+        intro("À chaque fin de mois du passé, le site reconstruit le portefeuille avec <b>les seules données connues ce jour-là</b>, le détient un mois, "
+              "puis recommence. Aucun réglage n'a vu le futur. La référence honnête est l'<b>univers à poids égaux</b> : mêmes titres, aucun choix.")
+        if st.button("Lancer les tests de chance (environ une minute)", type="primary", key="mod_go"):
+            st.session_state["mod_lance"] = cle_reglages
+        if st.session_state.get("mod_lance") != cle_reglages:
+            if st.session_state.get("mod_lance"):
+                st.caption("Les réglages ont changé : relance les tests pour ce nouveau modèle.")
+            return None
+        bt = modele_backtest_cache(pu, sect, plac, n, ps_t, mode, borne, forces)
+        if bt is None or len(bt["r"]) < 120:
+            st.info("Historique trop court pour un test hors échantillon (il faut au moins un an et demi de cours).")
+            return None
+        r_m, r_e = bt["r"], bt["r_egal"]
+        r_b = bu.pct_change(fill_method=None).reindex(r_m.index).fillna(0.0) if bu is not None else None
+        bm, be = A.bilan_serie(r_m), A.bilan_serie(r_e)
+        bb = A.bilan_serie(r_b) if r_b is not None else None
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=r_m.index, y=(1 + r_m).cumprod() - 1, name="Portefeuille modèle", line=dict(width=2.4, color=PALETTE[0])))
+        fig.add_trace(go.Scatter(x=r_e.index, y=(1 + r_e).cumprod() - 1, name="Univers à poids égaux", line=dict(width=1.8, color=PALETTE[2])))
+        if r_b is not None:
+            fig.add_trace(go.Scatter(x=r_b.index, y=(1 + r_b).cumprod() - 1, name="Euronext 100", line=dict(width=1.6, color=PALETTE[6], dash="dot")))
+        fig.update_layout(height=340, yaxis_tickformat="+.0%", margin=dict(t=10, l=0, r=0, b=0), legend=dict(orientation="h", y=-0.15), hovermode="x unified")
+        graphe(fig, key="mod_bt")
+        c = st.columns(5)
+        kpi(c[0], "Rendement annualisé", pct(bm["rend"], 1, True), f"poids égaux {pct(be['rend'], 1, True)}", delta_color="off")
+        kpi(c[1], "Volatilité", pct(bm["vol"], 1), f"poids égaux {pct(be['vol'], 1)}", delta_color="off")
+        kpi(c[2], "Ratio de Sharpe", f"{bm['sharpe']:.2f}".replace(".", ","), f"poids égaux {be['sharpe']:.2f}".replace(".", ","), delta_color="off")
+        kpi(c[3], "Plus forte baisse", pct(bm["baisse"], 0), f"poids égaux {pct(be['baisse'], 0)}", delta_color="off")
+        kpi(c[4], "Rotation mensuelle", pct(bt["rotation"], 0) if pd.notna(bt["rotation"]) else "—", "part du portefeuille renouvelée", delta_color="off")
+        st.caption(f"Du {r_m.index.min():%d/%m/%Y} au {r_m.index.max():%d/%m/%Y}, {len(bt['compositions'])} reconstructions mensuelles. "
+                   "Attention : l'univers est celui d'aujourd'hui (les titres disparus ou déclassés n'y sont pas), donc tous les rendements absolus sont trop flatteurs. "
+                   "C'est pour cela que le modèle est jugé face à l'univers à poids égaux et aux tirages au hasard, qui profitent du même biais.")
 
-    oui, non = "Confirmé", "Non confirmé"
-    lignes, nb_ok = [], 0
-    def ajoute(test, question, resultat, ok):
-        nonlocal nb_ok
-        nb_ok += int(bool(ok))
-        lignes.append({"test": test, "question": question, "resultat": resultat, "verdict": oui if ok else non})
-    if "p_rendement" in cf:
-        ajoute("Hasard : rendement", "Des portefeuilles tirés au sort aux mêmes dates font-ils aussi bien ?",
-               f"{pct(cf['p_rendement'], 1)} des tirages font au moins aussi bien", cf["p_rendement"] < 0.05)
-        ajoute("Hasard : Sharpe", "Et à risque comparable ?", f"{pct(cf['p_sharpe'], 1)} des tirages ont un Sharpe au moins égal", cf["p_sharpe"] < 0.05)
-    if "p_alpha" in cf:
-        ajoute("Alpha face à l'Euronext 100", "Le rendement non expliqué par le bêta dépasse-t-il le bruit ? (bootstrap par blocs)",
-               f"alpha {pct(cf['alpha_an'], 1, True)} par an, p = {cf['p_alpha']:.3f}".replace(".", ","), cf["p_alpha"] < 0.05)
-    if "dsr" in cf:
-        ajoute("Sharpe dégonflé", f"Le Sharpe résiste-t-il au fait d'avoir essayé {n_essais} réglages ?",
-               f"probabilité {pct(cf['dsr'], 0)} que le vrai Sharpe soit positif", cf["dsr"] > 0.95)
-    if "part_annees" in cf and pd.notna(cf["part_annees"]):
-        stable = cf["part_annees"] >= 0.6 and min(cf["moities"]) > 0
-        ajoute("Stabilité dans le temps", "Le modèle bat-il l'univers à poids égaux la plupart des années, et dans chaque moitié de la période ?",
-               f"{pct(cf['part_annees'], 0)} des années ; moitiés : {pct(cf['moities'][0], 0, True)} puis {pct(cf['moities'][1], 0, True)}", stable)
-    if len(variantes):
-        part = float(variantes["bat"].mean())
-        ajoute("Robustesse aux réglages", "Les réglages voisins marchent-ils aussi, ou seul celui-ci ?",
-               f"{int(variantes['bat'].sum())} variantes sur {len(variantes)} battent les poids égaux", part >= 0.75)
-    total = len(lignes)
-    c = st.columns(3)
-    kpi(c[0], "Confirmations", f"{nb_ok} sur {total}", "tests réussis", delta_color="off")
-    kpi(c[1], "Réglages essayés", f"{n_essais}", f"{n_conf} par toi, {len(variantes)} variantes, 3 pondérations", delta_color="off")
-    if fac is not None:
-        kpi(c[2], "Alpha une fois les facteurs retirés", pct(fac["alpha"] * 252, 1, True), f"t = {fac['t_alpha']:.1f}".replace(".", ","), delta_color="off")
-    if total and nb_ok >= max(total - 1, 1):
-        st.success(f"{nb_ok} confirmations sur {total} : le résultat est solide pour un modèle aussi simple. Tu peux passer à l'analyse en profondeur "
-                   "des titres proposés (thèse, menace, bilan, valorisation), un par un.")
-    elif total and nb_ok >= total / 2:
-        st.warning(f"{nb_ok} confirmations sur {total} : résultat fragile. Utilise la liste comme une piste parmi d'autres, sans lui donner de poids particulier.")
+        st.markdown("**Les quatre pondérations côte à côte**")
+        if st.toggle("Comparer les quatre pondérations (trois tests de plus : compte une à deux minutes)", key="mod_cmp"):
+            cmp_ = modele_ponderations_cache(pu, sect, plac, n, ps_t, borne, forces).sort_values("vol_prev")
+            tableau(cmp_.drop(columns="mode").style.format({"vol_prev": lambda v: pct(v, 1), "dr": lambda v: f"{v:.2f}".replace(".", ","), "hhi": lambda v: pct(v, 1),
+                                                            "max": lambda v: pct(v, 1), "rend": lambda v: pct(v, 1, True), "vol": lambda v: pct(v, 1),
+                                                            "sharpe": lambda v: f"{v:.2f}".replace(".", ","), "baisse": lambda v: pct(v, 0)})
+                    .apply(lambda r_: ["font-weight:700" if r_["ponderation"] == lib_mode else "" for _ in r_], axis=1),
+                    hide_index=True, column_config={"ponderation": "Pondération", "vol_prev": "Vol. prévue", "dr": "Diversif.", "hhi": "HHI",
+                                                    "max": "Poids max", "rend": "Rendement", "vol": "Volatilité",
+                                                    "sharpe": "Sharpe", "baisse": "Baisse max"})
+            st.caption("Du moins risqué au plus risqué, pour les mêmes titres. Les quatre premières colonnes (volatilité prévue, ratio de diversification, HHI, poids maximal) "
+                       "décrivent le portefeuille d'aujourd'hui ; les quatre suivantes (rendement annualisé, volatilité, Sharpe, plus forte baisse) viennent du test hors échantillon. En gras : la pondération sélectionnée. Choisis d'abord sur le risque et sur les critères du concours (ratio de diversification, HHI) : "
+                       "le rendement passé est la colonne la moins fiable, et retenir la pondération au meilleur Sharpe compte comme un réglage de plus.")
+
+        # ---------- 3. confirmations
+        st.markdown("**La batterie de confirmations**")
+        st.caption("Chaque test pose une question différente. Un seul test réussi ne prouve rien ; c'est leur accord qui compte.")
+        n_conf = len(essais)
+        singes = modele_singes_cache(pu, sect, plac, tuple(bt["compositions"].keys()), n)
+        variantes = modele_variantes_cache(pu, sect, plac, n, ps_t, mode, borne, forces)
+        n_essais = n_conf + len(variantes) + 3          # + les trois autres pondérations du tableau comparatif
+        cf = modele_confirm_cache(r_m, r_e, r_b, singes, n_essais)
+        X = pd.DataFrame({"Marché": r_b}) if r_b is not None else pd.DataFrame(index=r_m.index)
+        wml, bv = wml_cache(pu), bv_cache(pu)
+        if len(wml) > 60:
+            X["Momentum"] = wml
+        if len(bv) > 60:
+            X["Basse volatilité"] = bv
+        fac = A.regression_multi(r_m, X) if X.shape[1] else None
+
+        oui, non = "Confirmé", "Non confirmé"
+        lignes, nb_ok = [], 0
+        def ajoute(test, question, resultat, ok):
+            nonlocal nb_ok
+            nb_ok += int(bool(ok))
+            lignes.append({"test": test, "question": question, "resultat": resultat, "verdict": oui if ok else non})
+        if "p_rendement" in cf:
+            ajoute("Hasard : rendement", "Des portefeuilles tirés au sort aux mêmes dates font-ils aussi bien ?",
+                   f"{pct(cf['p_rendement'], 1)} des tirages font au moins aussi bien", cf["p_rendement"] < 0.05)
+            ajoute("Hasard : Sharpe", "Et à risque comparable ?", f"{pct(cf['p_sharpe'], 1)} des tirages ont un Sharpe au moins égal", cf["p_sharpe"] < 0.05)
+        if "p_alpha" in cf:
+            ajoute("Alpha face à l'Euronext 100", "Le rendement non expliqué par le bêta dépasse-t-il le bruit ? (bootstrap par blocs)",
+                   f"alpha {pct(cf['alpha_an'], 1, True)} par an, p = {cf['p_alpha']:.3f}".replace(".", ","), cf["p_alpha"] < 0.05)
+        if "dsr" in cf:
+            ajoute("Sharpe dégonflé", f"Le Sharpe résiste-t-il au fait d'avoir essayé {n_essais} réglages ?",
+                   f"probabilité {pct(cf['dsr'], 0)} que le vrai Sharpe soit positif", cf["dsr"] > 0.95)
+        if "part_annees" in cf and pd.notna(cf["part_annees"]):
+            stable = cf["part_annees"] >= 0.6 and min(cf["moities"]) > 0
+            ajoute("Stabilité dans le temps", "Le modèle bat-il l'univers à poids égaux la plupart des années, et dans chaque moitié de la période ?",
+                   f"{pct(cf['part_annees'], 0)} des années ; moitiés : {pct(cf['moities'][0], 0, True)} puis {pct(cf['moities'][1], 0, True)}", stable)
+        if len(variantes):
+            part = float(variantes["bat"].mean())
+            ajoute("Robustesse aux réglages", "Les réglages voisins marchent-ils aussi, ou seul celui-ci ?",
+                   f"{int(variantes['bat'].sum())} variantes sur {len(variantes)} battent les poids égaux", part >= 0.75)
+        total = len(lignes)
+        c = st.columns(3)
+        kpi(c[0], "Confirmations", f"{nb_ok} sur {total}", "tests réussis", delta_color="off")
+        kpi(c[1], "Réglages essayés", f"{n_essais}", f"{n_conf} par toi, {len(variantes)} variantes, 3 pondérations", delta_color="off")
+        if fac is not None:
+            kpi(c[2], "Alpha une fois les facteurs retirés", pct(fac["alpha"] * 252, 1, True), f"t = {fac['t_alpha']:.1f}".replace(".", ","), delta_color="off")
+        if total and nb_ok >= max(total - 1, 1):
+            st.success(f"{nb_ok} confirmations sur {total} : le résultat est solide pour un modèle aussi simple. Tu peux passer à l'analyse en profondeur "
+                       "des titres proposés (thèse, menace, bilan, valorisation), un par un.")
+        elif total and nb_ok >= total / 2:
+            st.warning(f"{nb_ok} confirmations sur {total} : résultat fragile. Utilise la liste comme une piste parmi d'autres, sans lui donner de poids particulier.")
+        else:
+            st.error(f"{nb_ok} confirmations sur {total} : le modèle ne se distingue pas du hasard sur cette période. N'en tire pas d'idées d'achat avec ces réglages. "
+                     "Ne multiplie pas les réglages jusqu'à ce que ça passe : chaque essai de plus rend le test plus exigeant (Sharpe dégonflé).")
+        st.html(CSS_GLOBAL + '<div class="nw-al">' + "".join(
+            f'<div class="a {"ok" if l["verdict"] == oui else "bad"}"><span class="tag" style="min-width:104px;text-align:center;'
+            f'{"background:rgba(34,197,94,.14);color:#15803d" if l["verdict"] == oui else ""}">{l["verdict"]}</span>'
+            f'<span><b>{html.escape(l["test"])}</b> · {html.escape(l["question"])}<br><span style="opacity:.8">{html.escape(l["resultat"])}</span></span></div>'
+            for l in lignes) + "</div>")
+
+        g, d = st.columns(2)
+        with g:
+            if "singes_total" in cf:
+                tot = cf["singes_total"]
+                fig = go.Figure(go.Histogram(x=tot, nbinsx=50, marker_color=C_NEUTRE, hovertemplate="%{x:+.0%} : %{y} tirages<extra></extra>"))
+                fig.add_vline(x=bm["total"], line_color=PALETTE[0], line_width=3)
+                fig.add_annotation(x=bm["total"], y=1, yref="paper", text="Modèle", showarrow=False, yanchor="bottom", font=dict(color=PALETTE[0]))
+                fig.update_layout(height=300, margin=dict(t=36, l=0, r=0, b=0), xaxis_tickformat="+.0%", bargap=0.02,
+                                  title=dict(text=f"Rendement total de {len(tot)} portefeuilles tirés au sort", font_size=13))
+                graphe(fig, key="mod_singes")
+        with d:
+            if "annees" in cf and len(cf["annees"]):
+                an = cf["annees"]
+                fig = go.Figure()
+                fig.add_trace(go.Bar(x=an.index.astype(str), y=an["m"], name="Modèle", marker_color=PALETTE[0]))
+                fig.add_trace(go.Bar(x=an.index.astype(str), y=an["e"], name="Poids égaux", marker_color=PALETTE[2]))
+                fig.update_layout(height=300, margin=dict(t=36, l=0, r=0, b=0), yaxis_tickformat="+.0%", barmode="group", legend=dict(orientation="h", y=-0.15),
+                                  title=dict(text="Année par année", font_size=13))
+                graphe(fig, key="mod_annees")
+        if len(variantes):
+            st.markdown("**Les variantes testées**")
+            tableau(variantes.assign(bat=variantes["bat"].map({True: "Oui", False: "Non"})).style.format({
+                "rend": lambda v: pct(v, 1, True), "sharpe": lambda v: f"{v:.2f}".replace(".", ","), "ecart": lambda v: pct(v, 1, True)})
+                .map(signe_couleur, subset=["ecart"]),
+                hide_index=True, column_config={"variante": "Variante", "rend": "Rendement annualisé", "sharpe": "Sharpe",
+                                                "ecart": "Écart avec les poids égaux", "bat": "Bat les poids égaux (Sharpe)"})
+        if fac is not None:
+            st.markdown("**D'où vient la performance ?**")
+            st.caption("Régression du modèle sur le marché et sur les facteurs momentum et basse volatilité construits sur le même univers. "
+                       + ", ".join(f"{k} : {v:+.2f}".replace(".", ",") for k, v in fac["betas"].items())
+                       + f" ; R² ajusté {pct(fac['r2_adj'], 0)}. Un alpha proche de zéro est le résultat attendu : le modèle ne fait que s'exposer à ces facteurs "
+                         "connus. Ce n'est pas un défaut, mais ce n'est pas du talent de sélection non plus.")
+        return nb_ok, total
+
+    verdict = _etape_chance()
+    dessine_barre()
+
+    # ---------- 4. approfondir
+    st.markdown("### Étape 4 · Approfondir, titre par titre")
+    if verdict is None:
+        st.info("Cette étape s'ouvre après les tests de chance. Tant que le modèle n'a pas montré qu'il se distingue du hasard, étudier ses titres un par un "
+                "revient à étudier des titres pris au sort.")
     else:
-        st.error(f"{nb_ok} confirmations sur {total} : le modèle ne se distingue pas du hasard sur cette période. N'en tire pas d'idées d'achat avec ces réglages. "
-                 "Ne multiplie pas les réglages jusqu'à ce que ça passe : chaque essai de plus rend le test plus exigeant (Sharpe dégonflé).")
-    st.html(CSS_GLOBAL + '<div class="nw-al">' + "".join(
-        f'<div class="a {"ok" if l["verdict"] == oui else "bad"}"><span class="tag" style="min-width:104px;text-align:center;'
-        f'{"background:rgba(34,197,94,.14);color:#15803d" if l["verdict"] == oui else ""}">{l["verdict"]}</span>'
-        f'<span><b>{html.escape(l["test"])}</b> · {html.escape(l["question"])}<br><span style="opacity:.8">{html.escape(l["resultat"])}</span></span></div>'
-        for l in lignes) + "</div>")
+        nb_ok, total = verdict
+        convaincant = bool(total) and nb_ok >= max(total - 1, 1)
+        dessine_barre(convaincant)
+        if convaincant:
+            st.success("Le modèle a passé les tests : ses titres méritent une analyse. L'analyse reste la tienne : le modèle ne voit ni les bilans, ni les résultats, ni les événements à venir.")
+        else:
+            st.error(f"Arrête-toi ici : {nb_ok} confirmation{'s' if nb_ok > 1 else ''} sur {total}. Rien n'indique que ces titres valent mieux que d'autres. "
+                     "Le résultat utile de cette page est justement de ne pas suivre ce modèle.")
+        if convaincant or st.checkbox("Voir quand même la suite, à titre d'exploration", key="mod_force"):
+            ordre = sorted(idees, key=lambda t: -(rob["frequence"].get(t, 0) if rob is not None else 0))
+            st.markdown(f"**À étudier en premier** ({len(ordre)} titres absents de ton portefeuille"
+                        + (", les plus solides d'abord" if rob is not None else "") + ") : "
+                        + (", ".join(str(u["nom"].get(t, t)) for t in ordre[:12]) if ordre else "aucun") + ".")
+            c = st.columns(4)
+            if ordre and c[0].button("Voir leurs résultats et leur qualité", key="mod_vers_res", type="primary"):
+                st.session_state["res_libres"] = ", ".join(t for t in ordre[:12] if t != OR_TICKER)
+                st.switch_page(PAGES["resultats"])
+            c[1].page_link(PAGES["candidats"], label="Candidats : les règles d'entrée")
+            c[2].page_link(PAGES["valorisation"], label="Valorisation : le prix payé")
+            c[3].page_link(PAGES["simulateur"], label="Simulateur : tester l'ordre")
+            st.markdown("Pour chaque titre retenu, dans l'ordre : **1.** les bénéfices suivent-ils le cours ? (Résultats et qualité) · **2.** le prix est-il raisonnable ? (Valorisation) · "
+                        "**3.** respecte-t-il tes règles ? (Candidats) · **4.** que fait-il à ton risque ? (Simulateur) · **5.** écris la thèse, la menace et la condition de sortie avant d'acheter.")
 
-    g, d = st.columns(2)
-    with g:
-        if "singes_total" in cf:
-            tot = cf["singes_total"]
-            fig = go.Figure(go.Histogram(x=tot, nbinsx=50, marker_color=C_NEUTRE, hovertemplate="%{x:+.0%} : %{y} tirages<extra></extra>"))
-            fig.add_vline(x=bm["total"], line_color=PALETTE[0], line_width=3)
-            fig.add_annotation(x=bm["total"], y=1, yref="paper", text="Modèle", showarrow=False, yanchor="bottom", font=dict(color=PALETTE[0]))
-            fig.update_layout(height=300, margin=dict(t=36, l=0, r=0, b=0), xaxis_tickformat="+.0%", bargap=0.02,
-                              title=dict(text=f"Rendement total de {len(tot)} portefeuilles tirés au sort", font_size=13))
-            graphe(fig, key="mod_singes")
-    with d:
-        if "annees" in cf and len(cf["annees"]):
-            an = cf["annees"]
-            fig = go.Figure()
-            fig.add_trace(go.Bar(x=an.index.astype(str), y=an["m"], name="Modèle", marker_color=PALETTE[0]))
-            fig.add_trace(go.Bar(x=an.index.astype(str), y=an["e"], name="Poids égaux", marker_color=PALETTE[2]))
-            fig.update_layout(height=300, margin=dict(t=36, l=0, r=0, b=0), yaxis_tickformat="+.0%", barmode="group", legend=dict(orientation="h", y=-0.15),
-                              title=dict(text="Année par année", font_size=13))
-            graphe(fig, key="mod_annees")
-    if len(variantes):
-        st.markdown("**Les variantes testées**")
-        tableau(variantes.assign(bat=variantes["bat"].map({True: "Oui", False: "Non"})).style.format({
-            "rend": lambda v: pct(v, 1, True), "sharpe": lambda v: f"{v:.2f}".replace(".", ","), "ecart": lambda v: pct(v, 1, True)})
-            .map(signe_couleur, subset=["ecart"]),
-            hide_index=True, column_config={"variante": "Variante", "rend": "Rendement annualisé", "sharpe": "Sharpe",
-                                            "ecart": "Écart avec les poids égaux", "bat": "Bat les poids égaux (Sharpe)"})
-    if fac is not None:
-        st.markdown("**D'où vient la performance ?**")
-        st.caption("Régression du modèle sur le marché et sur les facteurs momentum et basse volatilité construits sur le même univers. "
-                   + ", ".join(f"{k} : {v:+.2f}".replace(".", ",") for k, v in fac["betas"].items())
-                   + f" ; R² ajusté {pct(fac['r2_adj'], 0)}. Un alpha proche de zéro est le résultat attendu : le modèle ne fait que s'exposer à ces facteurs "
-                     "connus. Ce n'est pas un défaut, mais ce n'est pas du talent de sélection non plus.")
     st.markdown("### Comment lire cette page")
     st.markdown(
-        "- **L'ordre compte** : d'abord les confirmations, ensuite seulement l'analyse des titres. Un titre proposé par un modèle non confirmé ne vaut pas mieux qu'un titre pris au hasard.\n"
+        "- **L'ordre compte** : construire, simuler, tester la chance, et seulement ensuite analyser les titres. Un titre proposé par un modèle non confirmé ne vaut pas mieux qu'un titre pris au hasard.\n"
+        "- **Étape 1, la solidité** : un titre retenu dans 90 % des scénarios est un choix du modèle ; un titre à 30 % est un accident du calendrier.\n"
+        "- **Étape 2, la simulation** : elle ne dit pas ce qui va arriver, elle dit à quel point les issues possibles sont dispersées. Garde l'hypothèse « aucun avantage ».\n"
+        "- **L'or** : imposé comme amortisseur, pas choisi par les signaux. Regarde ce qu'il change au mauvais cas de l'étape 2 et aux crises rejouées.\n"
         "- **Ce que le modèle ne voit pas** : les bilans, les résultats, les révisions des analystes, les événements à venir. Yahoo ne donne pas ces données telles qu'elles "
         "étaient connues dans le passé, donc on ne peut pas les tester honnêtement hors échantillon. Elles interviennent à l'étape suivante, dans « Résultats et qualité » et dans ta fiche de ligne.\n"
         "- **Les limites du test** : l'univers d'aujourd'hui (biais du survivant), pas de frais, des poids fixes dans le mois, quelques années d'historique seulement. "
@@ -4099,6 +4298,7 @@ NAV = {
         st.Page(page_journal, title="Journal", icon=":material/receipt_long:", url_path="journal"),
     ],
     "Décider": [
+        st.Page(page_modele, title="Portefeuille modèle", icon=":material/auto_awesome:", url_path="modele"),
         st.Page(page_candidats, title="Candidats", icon=":material/travel_explore:", url_path="candidats"),
         st.Page(page_valorisation, title="Valorisation", icon=":material/sell:", url_path="valorisation"),
         st.Page(page_resultats, title="Résultats et qualité", icon=":material/fact_check:", url_path="resultats"),
@@ -4116,7 +4316,6 @@ NAV = {
         st.Page(page_guide, title="Guide", icon=":material/menu_book:", url_path="guide"),
     ],
     "Laboratoire": [
-        st.Page(page_modele, title="Portefeuille modèle", icon=":material/auto_awesome:", url_path="modele"),
         st.Page(page_optimisation, title="Optimisation", icon=":material/tune:", url_path="optimisation"),
         st.Page(page_momentum, title="Momentum", icon=":material/speed:", url_path="momentum"),
         st.Page(page_regime, title="Régime de marché", icon=":material/waves:", url_path="regime"),

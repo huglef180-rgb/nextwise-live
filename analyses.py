@@ -815,7 +815,7 @@ def signaux_modele(prix, date):
                          "asym_beta": pd.Series(_beta(m > 0) - _beta(m < 0), index=f.columns)})
 
 
-def selection_modele(sig, secteurs, places, n=26, poids_signaux=None, cap_secteur=0.20, cap_place=0.30):
+def selection_modele(sig, secteurs, places, n=26, poids_signaux=None, cap_secteur=0.20, cap_place=0.30, forces=None):
     """Classe les titres par score composite (moyenne pondérée des scores centrés réduits) puis retient les n premiers
     en respectant un nombre maximal de titres par secteur et par place, pour que les plafonds restent atteignables."""
     ps = {"momentum": 1.0, "faible_vol": 1.0, "haut52": 0.0, "asym_beta": 0.0, "alpha": 0.0, **(poids_signaux or {})}
@@ -830,7 +830,9 @@ def selection_modele(sig, secteurs, places, n=26, poids_signaux=None, cap_secteu
     n = int(min(n, len(score)))
     max_s, max_p = max(1, int(np.floor(cap_secteur * n + 1e-9))), max(1, int(np.floor(cap_place * n + 1e-9)))
     cs, cp, choisis = {}, {}, []
-    for t in score.index:
+    # titres imposés (par exemple l'or, retenu pour son rôle d'amortisseur et non pour son score) : ils prennent une place, le classement remplit le reste
+    imposes = [t for t in (forces or []) if t in score.index]
+    for t in imposes + [t for t in score.index if t not in imposes]:
         s_, p_ = secteurs.get(t, "?"), places.get(t, "?")
         if cs.get(s_, 0) >= max_s or cp.get(p_, 0) >= max_p:
             continue
@@ -872,7 +874,7 @@ def _dates_rebal(prix):
     return list(fins) if fins[-1] == prix.index[-1] else list(fins) + [prix.index[-1]]
 
 
-def backtest_modele(prix, secteurs, places, n=26, poids_signaux=None, mode="mdp", borne=0.10, cap_secteur=0.20, cap_place=0.30):
+def backtest_modele(prix, secteurs, places, n=26, poids_signaux=None, mode="mdp", borne=0.10, cap_secteur=0.20, cap_place=0.30, forces=None):
     """Test hors échantillon « pas à pas » : à chaque fin de mois, le portefeuille est reconstruit avec les seules données
     connues ce jour-là, puis détenu le mois suivant (poids fixes dans le mois). Renvoie les rendements quotidiens,
     les compositions successives, la rotation moyenne et le rendement de l'univers à poids égaux (mêmes titres éligibles)."""
@@ -884,7 +886,7 @@ def backtest_modele(prix, secteurs, places, n=26, poids_signaux=None, mode="mdp"
         sig = signaux_modele(prix, d0)
         if sig.empty or len(sig) < max(6, min(n, 10)):
             continue
-        titres, _ = selection_modele(sig, secteurs, places, n, poids_signaux, cap_secteur, cap_place)
+        titres, _ = selection_modele(sig, secteurs, places, n, poids_signaux, cap_secteur, cap_place, forces)
         if len(titres) < 3:
             continue
         w = poids_modele(prix, d0, titres, secteurs, places, mode, borne, cap_secteur, cap_place)
@@ -1046,3 +1048,73 @@ def reaction_aux_cotes(facteur, proba):
     if reg is None:
         return None
     return {"pente": float(reg["beta"]), "t": float(reg.get("t_beta", np.nan)), "r2": float(reg["r2"]), "n": int(len(z))}
+
+
+# ================================================================== v11 : scénarios
+def _blocs(n_obs, longueur, bloc, rng, n_tirages=None):
+    """Indices d'un bootstrap par blocs circulaire : des morceaux de `bloc` jours consécutifs tirés au hasard et mis bout à bout.
+    Garder des blocs conserve l'enchaînement des jours (les séries de hausses ou de baisses), ce qu'un tirage jour par jour détruirait."""
+    k = int(np.ceil(longueur / bloc))
+    forme = (k,) if n_tirages is None else (n_tirages, k)
+    dep = rng.integers(0, n_obs, forme)
+    idx = (dep[..., None] + np.arange(bloc)) % n_obs
+    return idx.reshape(*forme[:-1], -1)[..., :longueur]
+
+
+def robustesse_modele(prix, date, secteurs, places, n=26, poids_signaux=None, mode="mdp", borne=0.10, forces=None,
+                      n_scen=200, bloc=21, graine=11, cap_secteur=0.20, cap_place=0.30):
+    """La sélection tient-elle si l'année écoulée s'était déroulée un peu autrement ? (rééchantillonnage, dans l'esprit de Michaud, 1998)
+    On remélange n_scen fois les mois de l'année écoulée (mêmes jours pour tous les titres, donc mêmes liens entre eux), et on refait
+    à chaque fois la sélection et les poids. Renvoie la fréquence de sélection de chaque titre, les poids moyens des titres retenus
+    sur les vraies données, leur dispersion, et la stabilité (fréquence moyenne des titres retenus)."""
+    h = nettoyer_prix(prix.loc[:date])
+    sig0 = signaux_modele(h, h.index[-1])
+    if sig0.empty:
+        return None
+    base, _ = selection_modele(sig0, secteurs, places, n, poids_signaux, cap_secteur, cap_place, forces)
+    if len(base) < 3:
+        return None
+    f = h.iloc[-275:][list(sig0.index)]
+    L = np.log1p(f.pct_change(fill_method=None).iloc[1:].fillna(0.0).values)
+    T = len(L)
+    rng = np.random.default_rng(graine)
+    freq = pd.Series(0.0, index=f.columns)
+    W = []
+    for _ in range(n_scen):
+        idx = _blocs(T, T, bloc, rng)
+        P = pd.DataFrame(np.exp(np.vstack([np.zeros(L.shape[1]), np.cumsum(L[idx], axis=0)])), index=f.index, columns=f.columns)
+        sg = signaux_modele(P, P.index[-1])
+        if sg.empty:
+            continue
+        tit, _ = selection_modele(sg, secteurs, places, n, poids_signaux, cap_secteur, cap_place, forces)
+        freq[tit] += 1
+        W.append(poids_modele(P, P.index[-1], base, secteurs, places, mode, borne, cap_secteur, cap_place).values)
+    if not W:
+        return None
+    W = np.array(W)
+    return {"frequence": freq / len(W), "base": base, "poids_moyens": pd.Series(W.mean(axis=0), index=base),
+            "poids_ecart": pd.Series(W.std(axis=0), index=base), "stabilite": float((freq / len(W)).reindex(base).mean()), "n": len(W)}
+
+
+def simulation_horizon(rendements, jours, n_sim=5000, bloc=10, graine=5, centrer_sur=None):
+    """Ce que les `jours` prochaines séances pourraient donner, par bootstrap par blocs des rendements passés.
+    `rendements` : une colonne par portefeuille, mêmes dates ; les mêmes jours sont tirés pour toutes les colonnes, donc les liens
+    entre portefeuilles sont conservés. `centrer_sur` : nom d'une colonne dont le rendement moyen est imposé à toutes les autres
+    (hypothèse « aucun avantage » : seuls le risque et la diversification distinguent alors les portefeuilles).
+    Renvoie deux tableaux (simulations × portefeuilles) : le rendement total et la plus forte baisse en cours de route."""
+    X = pd.DataFrame(rendements).dropna()
+    if len(X) < 120 or jours < 5:
+        return None
+    V = X.values.copy()
+    if centrer_sur is not None and centrer_sur in X.columns:
+        V = V - V.mean(axis=0) + V[:, list(X.columns).index(centrer_sur)].mean()
+    L = np.log1p(np.clip(V, -0.95, None))
+    rng = np.random.default_rng(graine)
+    tot, creux = [], []
+    for debut in range(0, n_sim, 1000):                      # par paquets, pour ne pas occuper trop de mémoire
+        m = min(1000, n_sim - debut)
+        chemins = np.cumsum(L[_blocs(len(L), jours, bloc, rng, m)], axis=1)          # (m, jours, k)
+        tot.append(np.expm1(chemins[:, -1, :]))
+        sommet = np.maximum.accumulate(np.maximum(chemins, 0.0), axis=1)
+        creux.append(np.expm1((chemins - sommet).min(axis=1)))
+    return pd.DataFrame(np.vstack(tot), columns=X.columns), pd.DataFrame(np.vstack(creux), columns=X.columns)

@@ -209,4 +209,23 @@ _b2 = A.backtest_modele(_Pt, {c: "S" for c in _Pq}, {c: "P" for c in _Pq}, 6, No
 test("test hors échantillon : les trous ne font pas perdre de rendement (écart cumulé inférieur à 1 point)",
      _b1 is not None and _b2 is not None and abs((1 + _b1["r"]).prod() - (1 + _b2["r"]).prod()) < 0.01)
 
+# --- v11 : scénarios
+_rb = A.robustesse_modele(_Pq, _iq[-1], {c: "S" for c in _Pq}, {c: "P" for c in _Pq}, 6, {"momentum": 0, "faible_vol": 0, "alpha": 1}, "equal", 0.2,
+                          n_scen=60, cap_secteur=1.0, cap_place=1.0)
+test("solidité : le titre à alpha planté est retenu dans presque tous les scénarios, les fréquences restent entre 0 et 1 et somment à 6",
+     _rb["frequence"]["T3"] > 0.9 and _rb["frequence"].between(0, 1).all() and abs(_rb["frequence"].sum() - 6) < 1e-9 and abs(_rb["poids_moyens"].sum() - 1) < 1e-6)
+_sf2, _ = A.selection_modele(_sq, {c: "S" for c in _Pq}, {c: "P" for c in _Pq}, 6, {"momentum": 1, "faible_vol": 0}, 1.0, 1.0, forces=[_sq["momentum"].idxmin()])
+test("titre imposé : il est retenu même avec le plus mauvais score, et le portefeuille garde 6 lignes", _sq["momentum"].idxmin() in _sf2 and len(_sf2) == 6)
+_gs = np.random.default_rng(9); _is = pd.bdate_range("2023-01-02", periods=750)
+_ms = _gs.normal(0.0004, 0.010, 750)
+_Rs = pd.DataFrame({"calme": 0.5 * _ms + _gs.normal(0, 0.002, 750), "agité": 1.5 * _ms + _gs.normal(0, 0.004, 750), "indice": _ms}, index=_is)
+_t1, _c1 = A.simulation_horizon(_Rs, 120, n_sim=4000, centrer_sur="indice")
+_th = 0.010 * np.sqrt(120)
+test("simulation : dispersion à 120 jours conforme à la théorie (σ × √120), baisse en cours de route toujours négative ou nulle",
+     abs(_t1["indice"].std() / _th - 1) < 0.12 and (_c1.values <= 1e-12).all() and _t1["agité"].std() > 2 * _t1["calme"].std())
+test("simulation « aucun avantage » : les trois portefeuilles ont le même rendement médian à 1,5 point près",
+     abs(_t1["calme"].median() - _t1["indice"].median()) < 0.015 and abs(_t1["agité"].median() - _t1["indice"].median()) < 0.02)
+_t2, _ = A.simulation_horizon(_Rs, 120, n_sim=4000)
+test("simulation : même graine, mêmes résultats (reproductible)", np.allclose(_t2.values, A.simulation_horizon(_Rs, 120, n_sim=4000)[0].values))
+
 print("\nTOUS LES TESTS PASSENT" if ok else "\nAU MOINS UN TEST ÉCHOUE")

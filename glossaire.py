@@ -359,6 +359,43 @@ G = {
         "Ce que ton portefeuille actuel aurait perdu si la crise rejouée se reproduisait à l'identique.",
         "C'est un ordre de grandeur : la prochaine crise ne ressemblera pas exactement à la précédente. À comparer à la perte de l'indice sur le même épisode.",
         "Crise de 2020 rejouée : −24 % pour toi, −35 % pour l'indice. Ton bêta bas t'aurait fait perdre 11 points de moins."),
+    # ------------------------------------------------------------------ portefeuille modèle : scénarios
+    "stabilite de la selection": (
+        "La fréquence moyenne à laquelle les titres retenus le restent quand on remélange 200 fois les mois de l'année écoulée et qu'on refait la sélection (rééchantillonnage, Michaud, 1998).",
+        "Au-dessus de 75 % : la sélection ne dépend pas d'un accident du calendrier. Sous 60 % : avec une année à peine différente, le modèle aurait choisi un autre portefeuille.",
+        "Stabilité de 74 % : en moyenne, un titre retenu aujourd'hui l'aurait été dans 148 scénarios sur 200."),
+    "frequence de selection": (
+        "La part des 200 scénarios dans lesquels le titre est retenu par le modèle.",
+        "80 % ou plus : choix solide. Moins de 50 % : le titre doit sa place à quelques semaines de cours. Un « remplaçant » à 70 % vaut mieux qu'un titulaire à 40 %.",
+        "Un titre retenu dans 180 scénarios sur 200 : 90 %, il serait choisi presque quoi qu'il arrive. Un autre dans 60 sur 200 : 30 %, un accident des données."),
+    "poids deplaces": (
+        "La part du portefeuille qui change quand on remplace les poids calculés sur la vraie année par la moyenne des poids calculés sur les 200 scénarios.",
+        "Sous 10 % : les poids sont stables. Au-dessus de 20 % : l'optimiseur réagit fortement à de petites différences de données, ses poids sont à prendre avec prudence.",
+        "4 % : en passant aux poids moyens des scénarios, seuls 4 % du portefeuille changeraient de ligne."),
+    "mauvais cas": (
+        "Le 5e centile des trajectoires simulées : le résultat qui n'est pire que dans une trajectoire sur vingt.",
+        "C'est le chiffre le plus utile de la simulation : il dit ce que tu risques si les prochains mois tournent mal, sans être le scénario catastrophe.",
+        "Mauvais cas à −9 % sur 50 000 € : une fois sur vingt, tu finirais le concours avec 4 500 € de moins qu'aujourd'hui, ou pire."),
+    "cas median": (
+        "Le résultat du milieu : la moitié des trajectoires simulées finissent au-dessus, l'autre moitié en dessous.",
+        "Ce n'est pas une prévision. Avec l'hypothèse « aucun avantage », il reflète seulement le rendement moyen passé de l'indice.",
+        "Cas médian à +6 % : sur 5 000 trajectoires, 2 500 font mieux que +6 % et 2 500 font moins bien."),
+    "bon cas": (
+        "Le 95e centile des trajectoires simulées : le résultat qui n'est dépassé que dans une trajectoire sur vingt.",
+        "L'écart entre le bon et le mauvais cas mesure l'incertitude. Plus la fourchette est large, moins le résultat final dépend de toi.",
+        "Mauvais cas −9 %, bon cas +25 % : sur les mois qui restent, la chance peut déplacer ton résultat de 34 points."),
+    "risque de finir en perte": (
+        "La part des trajectoires simulées qui finissent sous la valeur d'aujourd'hui.",
+        "Même un bon portefeuille d'actions a souvent 25 à 40 % de risque de perdre sur quelques mois. C'est normal, pas un défaut.",
+        "26 % : dans une trajectoire sur quatre, tu termines le concours plus bas qu'aujourd'hui."),
+    "baisse en cours de route": (
+        "La plus forte baisse depuis un sommet subie pendant la trajectoire (ici : celle de la trajectoire médiane).",
+        "C'est ce qu'il faudra supporter sans paniquer, même si la fin est bonne. À comparer entre portefeuilles : le plus calme est celui qu'on garde le plus facilement.",
+        "−7,6 % : dans une trajectoire typique, tu verras à un moment ton portefeuille 7,6 % sous son plus haut."),
+    "bat l'indice": (
+        "La part des trajectoires simulées où le portefeuille finit devant l'Euronext 100.",
+        "50 % = pile ou face. Avec l'hypothèse « aucun avantage », un chiffre un peu au-dessus de 50 % vient seulement d'une volatilité plus basse, pas d'un talent.",
+        "56 % : sur 5 000 trajectoires, 2 800 finissent devant l'indice."),
 }
 
 # Libellé du site (normalisé) -> entrée. Les libellés identiques à une clé n'ont pas besoin d'y figurer.
@@ -409,6 +446,8 @@ ALIAS = {
     "ecart implicite entre les deux issues": "ecart implicite",
     "si la probabilite monte de 10 points": "evenement binaire", "si le scenario de tension se realise": "evenement binaire", "s'il est ecarte": "evenement binaire",
     "cash apres": "cash",
+    "titres solides": "frequence de selection", "titres fragiles": "frequence de selection", "poids deplaces par les scenarios": "poids deplaces",
+    "le modele finit devant toi dans": "bat l'indice", "ecart dans le mauvais cas": "mauvais cas",
     "depuis le depart": "performance depuis le depart", "performance brute": "performance depuis le depart",
     "volume moyen": "volume", "montant echange par jour": "volume",
     "ecarts": "ecarts aux regles", "perte estimee du portefeuille": "perte estimee", "impact estime sur le portefeuille": "perte estimee",
