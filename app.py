@@ -22,6 +22,13 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import analyses as A
+try:
+    import glossaire as GL
+except Exception:   # si glossaire.py n'a pas été envoyé avec le reste, le site marche quand même, sans les « i »
+    class GL:
+        @staticmethod
+        def bulle(_):
+            return ""
 
 print("[nextwise] imports terminés", flush=True)
 
@@ -451,10 +458,19 @@ def contraintes(df):
 
 
 TABLE_CSS = """<style>
+.nw-i {display:inline-flex; align-items:center; justify-content:center; width:14px; height:14px; margin-left:5px; border-radius:50%;
+  border:1px solid rgba(128,128,128,.9); color:rgba(128,128,128,1); font:700 9px/1 Georgia, serif; text-transform:none; letter-spacing:0; cursor:help; vertical-align:middle;}
+.nw-i:hover, .nw-i:focus {border-color:#4F8BFF; color:#4F8BFF; outline:none;}
+.nw-tip {display:none; position:fixed; left:50%; bottom:20px; transform:translateX(-50%); width:min(640px, 92vw); z-index:999999; background:#111827; color:#f3f4f6;
+  border-radius:12px; padding:14px 18px 16px; font:400 .86rem/1.55 'Inter', 'Segoe UI', system-ui, sans-serif; text-transform:none; letter-spacing:0; white-space:normal;
+  text-align:left; box-shadow:0 12px 34px rgba(0,0,0,.4); cursor:default;}
+.nw-i:hover .nw-tip, .nw-i:focus .nw-tip {display:block;}
+.nw-tip .h {display:block; font-weight:700; font-size:.95rem; margin-bottom:2px;}
+.nw-tip .l {display:block; font-size:.68rem; font-weight:700; text-transform:uppercase; letter-spacing:.08em; color:#93c5fd; margin-top:9px;}
 .nwt {overflow-x:auto; margin:4px 0 0.8rem; border:1px solid rgba(128,128,128,.20); border-radius:12px}
 .nwt table {border-collapse:collapse; font-size:0.85rem; width:100%; font-variant-numeric:tabular-nums}
 .nwt thead th {text-align:left; padding:9px 10px; background:rgba(128,128,128,.07); border-bottom:1px solid rgba(128,128,128,.25);
-  white-space:nowrap; font-weight:600; font-size:.7rem; text-transform:uppercase; letter-spacing:.03em; opacity:.85}
+  white-space:nowrap; font-weight:600; font-size:.7rem; text-transform:uppercase; letter-spacing:.03em}
 .nwt td {padding:7px 10px; border-bottom:1px solid rgba(128,128,128,.12); white-space:nowrap}
 .nwt tbody tr:last-child td {border-bottom:none}
 .nwt tbody tr:hover td {background:rgba(79,139,255,.07)}
@@ -469,7 +485,8 @@ def tableau(data, column_config=None, hide_index=None, height=None, **_):
     noms = []
     for c in sty.data.columns:
         lab = (column_config or {}).get(c, c)
-        noms.append(lab if isinstance(lab, str) else str(c))
+        lab = lab if isinstance(lab, str) else str(c)
+        noms.append(html.escape(lab) + GL.bulle(lab))
     sty = sty.relabel_index(noms, axis="columns")
     sty = sty.hide(axis="index")   # l'index n'est jamais affiché : une colonne qui compte doit être une vraie colonne
     # chiffres alignés à droite (colonnes numériques, en-tête compris), comme dans un tableur
@@ -1085,7 +1102,17 @@ h3 {font-weight: 600 !important; margin-top: 0.6rem !important;}
 .nw-chip.gris {background:rgba(127,127,127,.15);}
 .nw-band {display:grid; grid-template-columns:repeat(auto-fit, minmax(132px, 1fr)); gap:10px; margin:2px 0 16px;}
 .nw-k {background:rgba(127,127,127,.07); border:1px solid rgba(127,127,127,.18); border-radius:12px; padding:10px 14px;}
-.nw-k .t {font-size:.7rem; text-transform:uppercase; letter-spacing:.07em; opacity:.65;}
+.nw-k .t {font-size:.7rem; text-transform:uppercase; letter-spacing:.07em;}
+.nw-k .t .tt {opacity:.65;}
+.nw-i {display:inline-flex; align-items:center; justify-content:center; width:14px; height:14px; margin-left:5px; border-radius:50%;
+  border:1px solid rgba(128,128,128,.9); color:rgba(128,128,128,1); font:700 9px/1 Georgia, serif; text-transform:none; letter-spacing:0; cursor:help; vertical-align:middle;}
+.nw-i:hover, .nw-i:focus {border-color:#4F8BFF; color:#4F8BFF; outline:none;}
+.nw-tip {display:none; position:fixed; left:50%; bottom:20px; transform:translateX(-50%); width:min(640px, 92vw); z-index:999999; background:#111827; color:#f3f4f6;
+  border-radius:12px; padding:14px 18px 16px; font:400 .86rem/1.55 'Inter', 'Segoe UI', system-ui, sans-serif; text-transform:none; letter-spacing:0; white-space:normal;
+  text-align:left; box-shadow:0 12px 34px rgba(0,0,0,.4); cursor:default;}
+.nw-i:hover .nw-tip, .nw-i:focus .nw-tip {display:block;}
+.nw-tip .h {display:block; font-weight:700; font-size:.95rem; margin-bottom:2px;}
+.nw-tip .l {display:block; font-size:.68rem; font-weight:700; text-transform:uppercase; letter-spacing:.08em; color:#93c5fd; margin-top:9px;}
 .nw-k .v {font-size:1.4rem; font-weight:650; font-variant-numeric:tabular-nums; line-height:1.3; margin-top:2px; white-space:nowrap;}
 .nw-k .s {font-size:.76rem; opacity:.85; font-variant-numeric:tabular-nums; line-height:1.35;}
 .nw-pos {color:#16a34a;} .nw-neg {color:#ef4444;} .nw-neu {opacity:.75;}
@@ -1145,7 +1172,7 @@ def bandeau():
     ]
     html = CSS_GLOBAL + '<div class="nw-top"><div class="titre">Portefeuille NextWise</div>' + \
            f'<div class="etat">Cours à {h_txt} · différés d\'environ 15 min {chips}</div></div><div class="nw-band">' + \
-           "".join(f'<div class="nw-k"><div class="t">{t}</div><div class="v">{v}</div><div class="s">{s_}</div></div>' for t, v, s_ in cartes) + "</div>"
+           "".join(f'<div class="nw-k"><div class="t"><span class="tt">{t}</span>{GL.bulle(t)}</div><div class="v">{v}</div><div class="s">{s_}</div></div>' for t, v, s_ in cartes) + "</div>"
     st.html(html)
 
 
@@ -1190,7 +1217,7 @@ def kpi(conteneur, titre, valeur, sous=None, delta_color="normal", **_):
             pos, neg = neg, pos
         cl = " nw-pos" if pos else (" nw-neg" if neg else "")
     s_ = f'<div class="s{cl}">{html.escape(str(sous))}</div>' if sous is not None and str(sous) != "" else ""
-    conteneur.html(f'<div class="nw-k solo"><div class="t">{html.escape(str(titre))}</div><div class="v">{v}</div>{s_}</div>')
+    conteneur.html(f'<div class="nw-k solo"><div class="t"><span class="tt">{html.escape(str(titre))}</span>{GL.bulle(titre)}</div><div class="v">{v}</div>{s_}</div>')
 
 
 def RF():
@@ -3308,23 +3335,27 @@ def page_modele():
           "réplication, puis fixe les poids sur le risque seul, avec les limites du concours. Ensuite, une batterie de tests vérifie si ce modèle "
           "aurait vraiment marché <b>hors échantillon</b>, ou s'il a seulement eu de la chance. "
           "<b>Ce n'est pas un pilote automatique</b> : c'est une source d'idées, à n'étudier en profondeur que si les confirmations sont là.")
-    c = st.columns([1.2, 1, 1.2, 1])
-    large = c[0].radio("Univers", ["Ma liste de départ", "Univers large"], horizontal=True, key="mod_univ") == "Univers large"
-    n = c[1].slider("Nombre de lignes", 12, 40, 26, key="mod_n")
-    lib_mode = c[2].selectbox("Pondération", list(MODES_MODELE), key="mod_mode")
-    borne = c[3].slider("Poids maximal par ligne (%)", 5, 10, 10, key="mod_borne") / 100
-    c = st.columns(5)
-    ps = {"alpha": c[4].slider("Poids de l'alpha", 0.0, 2.0, 0.0, 0.5, key="mod_w_alpha",
-                               help="Ce que le titre a gagné sur 12 mois (hors dernier mois) une fois retiré ce que son bêta explique, rapporté à son incertitude. "
-                                    "Un titre qui a monté seulement parce qu'il est très sensible au marché a un alpha nul. C'est le « momentum résiduel » "
-                                    "(Blitz, Huij et Martens, 2011), ici avec le marché comme seul facteur. Mets les autres curseurs à 0 pour sélectionner sur l'alpha seul."),
-          "momentum": c[0].slider("Poids du momentum 12-1", 0.0, 2.0, 1.0, 0.5, key="mod_w_mom"),
-          "faible_vol": c[1].slider("Poids de la faible volatilité", 0.0, 2.0, 1.0, 0.5, key="mod_w_vol"),
-          "haut52": c[2].slider("Poids du plus haut sur 52 semaines", 0.0, 2.0, 0.0, 0.5, key="mod_w_h52"),
-          "asym_beta": c[3].slider("Poids de l'asymétrie de bêta", 0.0, 2.0, 0.0, 0.5, key="mod_w_asym",
-                                   help="Bêta les jours de hausse moins bêta les jours de baisse, face à la moyenne de l'univers. Un titre qui monte plus qu'il ne baisse "
-                                        "avec le marché a une asymétrie positive. Signal très bruité (chaque bêta repose sur la moitié des séances) : il est à 0 par défaut. "
-                                        "Active-le et laisse les confirmations dire s'il apporte quelque chose.")}
+    # Un formulaire : on règle tout, puis un seul calcul. Sans lui, chaque curseur déplacé relançait le test complet.
+    with st.form("mod_reglages", border=False):
+        c = st.columns([1.2, 1, 1.2, 1])
+        large = c[0].radio("Univers", ["Ma liste de départ", "Univers large"], horizontal=True, key="mod_univ") == "Univers large"
+        n = c[1].slider("Nombre de lignes", 12, 40, 26, key="mod_n")
+        lib_mode = c[2].selectbox("Pondération", list(MODES_MODELE), key="mod_mode")
+        borne = c[3].slider("Poids maximal par ligne (%)", 5, 10, 10, key="mod_borne") / 100
+        c = st.columns(5)
+        ps = {"alpha": c[4].slider("Poids de l'alpha", 0.0, 2.0, 0.0, 0.5, key="mod_w_alpha",
+                                   help="Ce que le titre a gagné sur 12 mois (hors dernier mois) une fois retiré ce que son bêta explique, rapporté à son incertitude. "
+                                        "Un titre qui a monté seulement parce qu'il est très sensible au marché a un alpha nul. C'est le « momentum résiduel » "
+                                        "(Blitz, Huij et Martens, 2011), ici avec le marché comme seul facteur. Mets les autres curseurs à 0 pour sélectionner sur l'alpha seul."),
+              "momentum": c[0].slider("Poids du momentum 12-1", 0.0, 2.0, 1.0, 0.5, key="mod_w_mom"),
+              "faible_vol": c[1].slider("Poids de la faible volatilité", 0.0, 2.0, 1.0, 0.5, key="mod_w_vol"),
+              "haut52": c[2].slider("Poids du plus haut sur 52 semaines", 0.0, 2.0, 0.0, 0.5, key="mod_w_h52"),
+              "asym_beta": c[3].slider("Poids de l'asymétrie de bêta", 0.0, 2.0, 0.0, 0.5, key="mod_w_asym",
+                                       help="Bêta les jours de hausse moins bêta les jours de baisse, face à la moyenne de l'univers. Un titre qui monte plus qu'il ne baisse "
+                                            "avec le marché a une asymétrie positive. Signal très bruité (chaque bêta repose sur la moitié des séances) : il est à 0 par défaut. "
+                                            "Active-le et laisse les confirmations dire s'il apporte quelque chose.")}
+        st.form_submit_button("Appliquer les réglages", type="primary",
+                              help="Règle tout ce que tu veux, puis clique une seule fois : le test hors échantillon ne se relance qu'à ce moment-là.")
     if sum(ps.values()) == 0:
         st.warning("Donne un poids à au moins un signal.")
         return
@@ -3418,26 +3449,30 @@ def page_modele():
                "C'est pour cela que le modèle est jugé face à l'univers à poids égaux et aux tirages au hasard, qui profitent du même biais.")
 
     st.markdown("**Les quatre pondérations côte à côte**")
-    cmp_ = modele_ponderations_cache(pu, sect, plac, n, ps_t, borne).sort_values("vol_prev")
-    tableau(cmp_.drop(columns="mode").style.format({"vol_prev": lambda v: pct(v, 1), "dr": lambda v: f"{v:.2f}".replace(".", ","), "hhi": lambda v: pct(v, 1),
-                                                    "max": lambda v: pct(v, 1), "rend": lambda v: pct(v, 1, True), "vol": lambda v: pct(v, 1),
-                                                    "sharpe": lambda v: f"{v:.2f}".replace(".", ","), "baisse": lambda v: pct(v, 0)})
-            .apply(lambda r_: ["font-weight:700" if r_["ponderation"] == lib_mode else "" for _ in r_], axis=1),
-            hide_index=True, column_config={"ponderation": "Pondération", "vol_prev": "Vol. prévue", "dr": "Diversif.", "hhi": "HHI",
-                                            "max": "Poids max", "rend": "Rendement", "vol": "Volatilité",
-                                            "sharpe": "Sharpe", "baisse": "Baisse max"})
-    st.caption("Du moins risqué au plus risqué, pour les mêmes titres. Les quatre premières colonnes (volatilité prévue, ratio de diversification, HHI, poids maximal) "
-               "décrivent le portefeuille d'aujourd'hui ; les quatre suivantes (rendement annualisé, volatilité, Sharpe, plus forte baisse) viennent du test hors échantillon. En gras : la pondération sélectionnée. Choisis d'abord sur le risque et sur les critères du concours (ratio de diversification, HHI) : "
-               "le rendement passé est la colonne la moins fiable, et retenir la pondération au meilleur Sharpe compte comme un réglage de plus.")
+    if st.toggle("Comparer les quatre pondérations (trois tests de plus : compte une à deux minutes)", key="mod_cmp"):
+        cmp_ = modele_ponderations_cache(pu, sect, plac, n, ps_t, borne).sort_values("vol_prev")
+        tableau(cmp_.drop(columns="mode").style.format({"vol_prev": lambda v: pct(v, 1), "dr": lambda v: f"{v:.2f}".replace(".", ","), "hhi": lambda v: pct(v, 1),
+                                                        "max": lambda v: pct(v, 1), "rend": lambda v: pct(v, 1, True), "vol": lambda v: pct(v, 1),
+                                                        "sharpe": lambda v: f"{v:.2f}".replace(".", ","), "baisse": lambda v: pct(v, 0)})
+                .apply(lambda r_: ["font-weight:700" if r_["ponderation"] == lib_mode else "" for _ in r_], axis=1),
+                hide_index=True, column_config={"ponderation": "Pondération", "vol_prev": "Vol. prévue", "dr": "Diversif.", "hhi": "HHI",
+                                                "max": "Poids max", "rend": "Rendement", "vol": "Volatilité",
+                                                "sharpe": "Sharpe", "baisse": "Baisse max"})
+        st.caption("Du moins risqué au plus risqué, pour les mêmes titres. Les quatre premières colonnes (volatilité prévue, ratio de diversification, HHI, poids maximal) "
+                   "décrivent le portefeuille d'aujourd'hui ; les quatre suivantes (rendement annualisé, volatilité, Sharpe, plus forte baisse) viennent du test hors échantillon. En gras : la pondération sélectionnée. Choisis d'abord sur le risque et sur les critères du concours (ratio de diversification, HHI) : "
+                   "le rendement passé est la colonne la moins fiable, et retenir la pondération au meilleur Sharpe compte comme un réglage de plus.")
 
     # ---------- 3. confirmations
     st.markdown("### 3. La batterie de confirmations")
     intro("Chaque test pose une question différente. Un seul test réussi ne prouve rien ; c'est leur accord qui compte. "
           "Le calcul prend environ une minute la première fois.")
     n_conf = len(essais)
+    cle_reglages = (large, n, mode, borne, ps_t)
     if st.button("Lancer les confirmations", type="primary", key="mod_go"):
-        st.session_state["mod_lance"] = True
-    if not st.session_state.get("mod_lance"):
+        st.session_state["mod_lance"] = cle_reglages
+    if st.session_state.get("mod_lance") != cle_reglages:
+        if st.session_state.get("mod_lance"):
+            st.caption("Les réglages ont changé : relance les confirmations pour ce nouveau modèle.")
         return
     singes = modele_singes_cache(pu, sect, plac, tuple(bt["compositions"].keys()), n)
     variantes = modele_variantes_cache(pu, sect, plac, n, ps_t, mode, borne)
@@ -3964,6 +3999,8 @@ def page_rapport():
 # ================================================================== GUIDE
 GUIDE = {
     "Ta routine": """
+- **Le « i »** à côté d'un chiffre ou d'un titre de colonne : passe la souris dessus (ou touche-le sur téléphone) pour voir ce que c'est, comment le lire et un exemple chiffré.
+- **Laboratoire** (en bas du menu) : les pistes testées qui ne changent pas une décision au quotidien (portefeuille modèle, optimisation, momentum, régime, scénarios politiques, contrôle des données).
 - Les mêmes parcours sont cliquables en bas du *Tableau de bord* (« Par où passer »), et chaque page propose en bas « Et ensuite ? ».
 - **Chaque jour, 2 minutes** : le *Tableau de bord*. Regarde les alertes rouges et les contraintes, puis la carte des lignes.
 - **Avant chaque achat** : *Candidats* pour trouver, *Valorisation*, *Résultats et qualité* et MarketScreener pour vérifier, *Simulateur* pour tester, puis écris la thèse, la menace et la condition de sortie dans lignes.csv.
@@ -4051,6 +4088,8 @@ def page_guide():
 
 
 # ================================================================== NAVIGATION
+# Le menu : seules les pages qui mènent à une décision ou servent devant le jury sont en haut.
+# « Laboratoire » regroupe les pistes testées mais qui ne changent pas une décision au quotidien : elles restent consultables.
 NAV = {
     "Suivi": [
         st.Page(page_direct, title="Tableau de bord", icon=":material/dashboard:", default=True),
@@ -4061,28 +4100,28 @@ NAV = {
     ],
     "Décider": [
         st.Page(page_candidats, title="Candidats", icon=":material/travel_explore:", url_path="candidats"),
-        st.Page(page_modele, title="Portefeuille modèle", icon=":material/auto_awesome:", url_path="modele"),
-        st.Page(page_optimisation, title="Optimisation", icon=":material/tune:", url_path="optimisation"),
+        st.Page(page_valorisation, title="Valorisation", icon=":material/sell:", url_path="valorisation"),
+        st.Page(page_resultats, title="Résultats et qualité", icon=":material/fact_check:", url_path="resultats"),
         st.Page(page_simulateur, title="Simulateur", icon=":material/science:", url_path="simulateur"),
         st.Page(page_reequilibrage, title="Rééquilibrage", icon=":material/balance:", url_path="reequilibrage"),
     ],
     "Risque": [
         st.Page(page_risque, title="Risque", icon=":material/shield:", url_path="risque"),
         st.Page(page_stress, title="Stress tests", icon=":material/thunderstorm:", url_path="stress-tests"),
-        st.Page(page_politique, title="Scénarios politiques", icon=":material/how_to_vote:", url_path="politique"),
-        st.Page(page_regime, title="Régime de marché", icon=":material/waves:", url_path="regime"),
     ],
-    "Analyse": [
+    "Jury": [
         st.Page(page_performance, title="Performance", icon=":material/trending_up:", url_path="performance"),
         st.Page(page_chance, title="Chance ou talent", icon=":material/casino:", url_path="chance-ou-talent"),
-        st.Page(page_momentum, title="Momentum", icon=":material/speed:", url_path="momentum"),
-        st.Page(page_valorisation, title="Valorisation", icon=":material/sell:", url_path="valorisation"),
-        st.Page(page_resultats, title="Résultats et qualité", icon=":material/fact_check:", url_path="resultats"),
-    ],
-    "Outils": [
         st.Page(page_rapport, title="Rapport", icon=":material/summarize:", url_path="rapport"),
-        st.Page(page_donnees, title="Données", icon=":material/database:", url_path="donnees"),
         st.Page(page_guide, title="Guide", icon=":material/menu_book:", url_path="guide"),
+    ],
+    "Laboratoire": [
+        st.Page(page_modele, title="Portefeuille modèle", icon=":material/auto_awesome:", url_path="modele"),
+        st.Page(page_optimisation, title="Optimisation", icon=":material/tune:", url_path="optimisation"),
+        st.Page(page_momentum, title="Momentum", icon=":material/speed:", url_path="momentum"),
+        st.Page(page_regime, title="Régime de marché", icon=":material/waves:", url_path="regime"),
+        st.Page(page_politique, title="Scénarios politiques", icon=":material/how_to_vote:", url_path="politique"),
+        st.Page(page_donnees, title="Données", icon=":material/database:", url_path="donnees"),
     ],
 }
 PAGES = {(pg_.url_path or ""): pg_ for groupe_ in NAV.values() for pg_ in groupe_}
@@ -4095,7 +4134,7 @@ PARCOURS = {
     "Le 1er du mois": [("reequilibrage", "les ordres pour revenir aux poids cibles"), ("regles", "les règles encore respectées ?"),
                        ("risque", "volatilité, bêta, contributions"), ("stress-tests", "ce que ferait une crise"), ("rapport", "le bilan à garder en PDF")],
     "Pour le jury": [("score", "où tu en es sur les critères"), ("chance-ou-talent", "ce qui relève du hasard"),
-                     ("performance", "d'où vient le résultat"), ("modele", "ce qu'un processus purement quantitatif aurait fait")],
+                     ("performance", "d'où vient le résultat"), ("rapport", "le document à montrer")],
 }
 
 # La suite logique : ce qu'on ouvre en général après chaque page (affichée en bas de page).
@@ -4109,11 +4148,11 @@ SUITE = {
     "optimisation": [("simulateur", "tester les poids proposés"), ("reequilibrage", "en faire des ordres")],
     "simulateur": [("reequilibrage", "chiffrer les ordres"), ("journal", "enregistrer l'ordre passé")],
     "reequilibrage": [("simulateur", "tester avant de passer l'ordre"), ("journal", "enregistrer l'ordre passé")],
-    "risque": [("stress-tests", "ce que ferait une crise"), ("optimisation", "réduire le risque à lignes égales")],
-    "stress-tests": [("politique", "le risque d'élection en France"), ("regime", "le marché est-il déjà sous tension ?")],
+    "risque": [("stress-tests", "ce que ferait une crise"), ("reequilibrage", "alléger ce qui pèse trop")],
+    "stress-tests": [("risque", "ton risque aujourd'hui"), ("simulateur", "tester un allègement")],
     "politique": [("lignes", "la fiche des lignes exposées"), ("simulateur", "tester un allègement")],
     "regime": [("risque", "ton risque aujourd'hui"), ("stress-tests", "ce que ferait une crise")],
-    "performance": [("chance-ou-talent", "chance ou talent ?"), ("momentum", "la tendance de tes lignes")],
+    "performance": [("chance-ou-talent", "chance ou talent ?"), ("rapport", "garder une trace")],
     "chance-ou-talent": [("score", "ce que ça change pour le concours"), ("rapport", "garder une trace")],
     "momentum": [("resultats", "la hausse est-elle soutenue par les bénéfices ?")],
     "valorisation": [("resultats", "croissance et qualité des bénéfices")],

@@ -440,7 +440,7 @@ def _contraintes_poids(n, borne, plancher=0.0):
     return Bounds(np.full(n, min(plancher, 1 / n)), np.full(n, borne)), [{"type": "eq", "fun": lambda w: w.sum() - 1, "jac": lambda w: np.ones(n)}]
 
 
-def optimiser(cov, mode, borne=0.10, groupes=None, plancher=0.0):
+def optimiser(cov, mode, borne=0.10, groupes=None, plancher=0.0, maxiter=500, ftol=1e-12):
     """Portefeuilles fondés sur le risque seul (sans prévision de rendement, donc robustes) :
     'minvar' variance minimale, 'mdp' diversification maximale (Choueifaty et Coignard, 2008),
     'erc' parité de risque (Maillard, Roncalli et Teïletche, 2010).
@@ -476,7 +476,7 @@ def optimiser(cov, mode, borne=0.10, groupes=None, plancher=0.0):
             return 2e2 / v * (d * g + cov @ (w * d) - 2 * g * (d @ sh))
     else:
         return w0
-    r = minimize(f, w0, jac=jac, method="SLSQP", bounds=bornes, constraints=cons, options={"maxiter": 500, "ftol": 1e-12})
+    r = minimize(f, w0, jac=jac, method="SLSQP", bounds=bornes, constraints=cons, options={"maxiter": maxiter, "ftol": ftol})
     w = np.clip(r.x, 0, None)
     return w / w.sum()
 
@@ -858,7 +858,7 @@ def poids_modele(prix, date, titres, secteurs, places, mode="mdp", borne=0.10, c
     sec, pla = np.array([secteurs.get(t, "?") for t in titres]), np.array([places.get(t, "?") for t in titres])
     groupes = [(sec == g, cap_secteur) for g in np.unique(sec)] + [(pla == g, cap_place) for g in np.unique(pla)]
     try:
-        w = optimiser(S, mode, borne, groupes, plancher=min(0.015, 0.5 / n))    # aucune ligne « fantôme » à 0 %
+        w = optimiser(S, mode, borne, groupes, plancher=min(0.015, 0.5 / n), maxiter=150, ftol=1e-9)    # aucune ligne « fantôme » à 0 %
     except Exception:
         w = np.full(n, 1 / n)
     if not np.isfinite(w).all():
