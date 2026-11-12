@@ -763,12 +763,21 @@ def _z(x):
     return ((x - x.mean()) / e).clip(-3, 3) if e and e > 0 else x * 0.0
 
 
+def nettoyer_prix(prix, seuil=0.5, limite=5):
+    """Rend un tableau de cours utilisable ligne à ligne : retire les jours où moins de la moitié des titres cotent
+    (jour férié général, ligne créée par les devises la nuit ou le week-end), puis reporte le dernier cours connu
+    pendant au plus 5 séances (jour férié local). Le report n'utilise que le passé : aucune information du futur."""
+    if prix is None or len(prix) == 0:
+        return prix
+    return prix.loc[prix.notna().mean(axis=1) >= seuil].ffill(limit=limite)
+
+
 def signaux_modele(prix, date):
     """Signaux calculés uniquement avec les cours connus à la date donnée (aucune information du futur) :
     momentum 12-1 (Jegadeesh et Titman, 1993), faible volatilité sur un an (Blitz et van Vliet, 2007),
     proximité du plus haut sur 52 semaines (George et Hwang, 2004), asymétrie de bêta (bêta à la hausse moins bêta à la baisse,
     dans l'esprit de Ang, Chen et Xing, 2006 ; signal bruité, proposé pour être testé, pas recommandé par défaut)."""
-    h = prix.loc[:date]
+    h = nettoyer_prix(prix.loc[:date])
     if len(h) < 275:
         return pd.DataFrame()
     f = h.iloc[-275:]
@@ -786,7 +795,21 @@ def signaux_modele(prix, date):
         mc = m[masque] - m[masque].mean()
         den = mc @ mc
         return (X[masque] - X[masque].mean(axis=0)).T @ mc / den if den > 0 else np.full(X.shape[1], np.nan)
-    return pd.DataFrame({"momentum": f.iloc[-22] / f.iloc[-253] - 1,
+    # alpha : rendement non expliqué par le marché sur 12 mois moins le dernier, rapporté à son incertitude (statistique t).
+    # C'est le « momentum résiduel » de Blitz, Huij et Martens (2011), ici avec un seul facteur (la moyenne de l'univers).
+    Xw, mw = X[:-21], m[:-21]
+    mc = mw - mw.mean()
+    den = mc @ mc
+    if den > 0 and len(mw) > 60:
+        b = (Xw - Xw.mean(axis=0)).T @ mc / den
+        a = Xw.mean(axis=0) - b * mw.mean()
+        e = Xw - a - np.outer(mw, b)
+        se = e.std(axis=0, ddof=2) / np.sqrt(len(mw))
+        alpha_t = np.where(se > 0, a / np.where(se > 0, se, 1.0), np.nan)
+    else:
+        alpha_t = np.full(X.shape[1], np.nan)
+    return pd.DataFrame({"alpha": pd.Series(alpha_t, index=f.columns),
+                         "momentum": f.iloc[-22] / f.iloc[-253] - 1,
                          "vol": r.std(ddof=1) * np.sqrt(252),
                          "haut52": f.iloc[-1] / f.iloc[-252:].max(),
                          "asym_beta": pd.Series(_beta(m > 0) - _beta(m < 0), index=f.columns)})
@@ -795,11 +818,12 @@ def signaux_modele(prix, date):
 def selection_modele(sig, secteurs, places, n=26, poids_signaux=None, cap_secteur=0.20, cap_place=0.30):
     """Classe les titres par score composite (moyenne pondérée des scores centrés réduits) puis retient les n premiers
     en respectant un nombre maximal de titres par secteur et par place, pour que les plafonds restent atteignables."""
-    ps = {"momentum": 1.0, "faible_vol": 1.0, "haut52": 0.0, "asym_beta": 0.0, **(poids_signaux or {})}
+    ps = {"momentum": 1.0, "faible_vol": 1.0, "haut52": 0.0, "asym_beta": 0.0, "alpha": 0.0, **(poids_signaux or {})}
     if sig is None or sig.empty:
         return [], pd.Series(dtype=float)
     z = pd.DataFrame({"momentum": _z(sig["momentum"]), "faible_vol": -_z(sig["vol"]), "haut52": _z(sig["haut52"]),
-                      "asym_beta": _z(sig["asym_beta"]).fillna(0.0) if "asym_beta" in sig else 0.0})
+                      "asym_beta": _z(sig["asym_beta"]).fillna(0.0) if "asym_beta" in sig else 0.0,
+                      "alpha": _z(sig["alpha"]).fillna(0.0) if "alpha" in sig else 0.0})
     tot = sum(abs(v) for v in ps.values())
     score = sum(ps[k] * z[k] for k in z.columns) / tot if tot > 0 else z.mean(axis=1) * 0.0
     score = score.dropna().sort_values(ascending=False, kind="mergesort")
@@ -852,6 +876,7 @@ def backtest_modele(prix, secteurs, places, n=26, poids_signaux=None, mode="mdp"
     """Test hors échantillon « pas à pas » : à chaque fin de mois, le portefeuille est reconstruit avec les seules données
     connues ce jour-là, puis détenu le mois suivant (poids fixes dans le mois). Renvoie les rendements quotidiens,
     les compositions successives, la rotation moyenne et le rendement de l'univers à poids égaux (mêmes titres éligibles)."""
+    prix = nettoyer_prix(prix)
     R = prix.pct_change(fill_method=None)
     dates = _dates_rebal(prix)
     morceaux, ew, compos, rot, w_prec = [], [], {}, [], None
@@ -884,6 +909,7 @@ def singes_modele(prix, secteurs, places, dates, n=26, cap_secteur=0.20, cap_pla
     le même nombre de titres dans le même univers éligible, avec les mêmes limites par secteur et par place, à poids égaux.
     Renvoie la matrice des rendements quotidiens (jours × singes)."""
     rng = np.random.default_rng(graine)
+    prix = nettoyer_prix(prix)
     R = prix.pct_change(fill_method=None)
     dates = sorted(dates) + [prix.index[-1]]
     blocs = []

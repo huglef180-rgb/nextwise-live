@@ -284,6 +284,12 @@ def _faux_historique(tickers, jours=1900):
         df = df.drop(columns=[c for c in ["EQNR.OL", "BZ=F", "IEGA.AS", "EUNH.DE", "IBGS.AS", "EURUSD=X", "^STOXX", "ASM.AS", "OR.PA"] if c in df.columns])
         if "KRZ.IR" in df.columns:
             df.loc[df.index[:-150], "KRZ.IR"] = np.nan
+        # la nuit et le week-end, Yahoo renvoie une dernière ligne où seules les devises cotent ; plus quelques jours fériés locaux
+        if df.shape[1]:
+            df.loc[df.index[-1] + pd.Timedelta(days=1)] = [df[c].iloc[-1] if c.endswith("=X") else np.nan for c in df.columns]
+        for k, c in enumerate(df.columns):
+            if not c.endswith("=X"):
+                df.iloc[[-23 - (k % 4), -254 + (k % 3), -400 - k], k] = np.nan
     return df, df.copy()
 
 
@@ -3282,7 +3288,8 @@ def modele_variantes_cache(prix, sect, plac, n, ps, mode, borne):
     var += [("Momentum seul", dict(ps={"momentum": 1, "faible_vol": 0, "haut52": 0})),
             ("Faible volatilité seule", dict(ps={"momentum": 0, "faible_vol": 1, "haut52": 0})),
             ("Momentum, volatilité et plus haut à parts égales", dict(ps={"momentum": 1, "faible_vol": 1, "haut52": 1})),
-            ("Asymétrie de bêta seule", dict(ps={"momentum": 0, "faible_vol": 0, "haut52": 0, "asym_beta": 1}))]
+            ("Asymétrie de bêta seule", dict(ps={"momentum": 0, "faible_vol": 0, "haut52": 0, "asym_beta": 1})),
+            ("Alpha seul", dict(ps={"momentum": 0, "faible_vol": 0, "haut52": 0, "alpha": 1}))]
     lignes = []
     for nom, ch in var:
         if "ps" in ch and {k: v for k, v in ch["ps"].items() if v} == {k: v for k, v in base.items() if v}:
@@ -3306,8 +3313,12 @@ def page_modele():
     n = c[1].slider("Nombre de lignes", 12, 40, 26, key="mod_n")
     lib_mode = c[2].selectbox("Pondération", list(MODES_MODELE), key="mod_mode")
     borne = c[3].slider("Poids maximal par ligne (%)", 5, 10, 10, key="mod_borne") / 100
-    c = st.columns(4)
-    ps = {"momentum": c[0].slider("Poids du momentum 12-1", 0.0, 2.0, 1.0, 0.5, key="mod_w_mom"),
+    c = st.columns(5)
+    ps = {"alpha": c[4].slider("Poids de l'alpha", 0.0, 2.0, 0.0, 0.5, key="mod_w_alpha",
+                               help="Ce que le titre a gagné sur 12 mois (hors dernier mois) une fois retiré ce que son bêta explique, rapporté à son incertitude. "
+                                    "Un titre qui a monté seulement parce qu'il est très sensible au marché a un alpha nul. C'est le « momentum résiduel » "
+                                    "(Blitz, Huij et Martens, 2011), ici avec le marché comme seul facteur. Mets les autres curseurs à 0 pour sélectionner sur l'alpha seul."),
+          "momentum": c[0].slider("Poids du momentum 12-1", 0.0, 2.0, 1.0, 0.5, key="mod_w_mom"),
           "faible_vol": c[1].slider("Poids de la faible volatilité", 0.0, 2.0, 1.0, 0.5, key="mod_w_vol"),
           "haut52": c[2].slider("Poids du plus haut sur 52 semaines", 0.0, 2.0, 0.0, 0.5, key="mod_w_h52"),
           "asym_beta": c[3].slider("Poids de l'asymétrie de bêta", 0.0, 2.0, 0.0, 0.5, key="mod_w_asym",
@@ -3319,6 +3330,10 @@ def page_modele():
         return
     mode = MODES_MODELE[lib_mode]
     pu, bu, u = prix_univers(not large)
+    if pu is not None and not pu.empty:
+        # jours sans cotation (lignes créées par les devises la nuit, jours fériés) : sans ce nettoyage, aucun titre n'a de cours « aujourd'hui »
+        pu = A.nettoyer_prix(pu)
+        pu = pu.loc[:, pu.notna().sum() > 0]
     if pu is None or pu.empty or len(pu) < 300:
         st.info("Historique de l'univers indisponible pour l'instant.")
         return
@@ -3338,7 +3353,7 @@ def page_modele():
     w = A.poids_modele(pu, pu.index[-1], titres, dict(sect), dict(plac), mode, borne)
     prop = pd.DataFrame({"nom": u["nom"].reindex(titres), "secteur": u["secteur"].reindex(titres), "place": u["place"].reindex(titres),
                          "poids": w, "score": score.reindex(titres), "momentum": sig["momentum"].reindex(titres), "vol": sig["vol"].reindex(titres),
-                         "asym": sig["asym_beta"].reindex(titres)})
+                         "asym": sig["asym_beta"].reindex(titres), "alpha": sig["alpha"].reindex(titres)})
     prop["detenu"] = ["Oui" if t in pf.index else "—" for t in prop.index]
     prop = prop.sort_values("poids", ascending=False)
     Rr = pu[titres].pct_change(fill_method=None).iloc[-252:]
@@ -3354,10 +3369,11 @@ def page_modele():
     kpi(c[3], "Secteurs couverts", f"{prop['secteur'].nunique()} sur 11", f"plus gros : {pct(prop.groupby('secteur')['poids'].sum().max(), 0)}", delta_color="off")
     kpi(c[4], "En commun avec toi", f"{len(communs)} titres", f"sur {len(titres)} dans le modèle", delta_color="off")
     tableau(prop.style.format({"poids": lambda v: pct(v, 1), "score": lambda v: f"{v:+.2f}".replace(".", ","), "momentum": lambda v: pct(v, 0, True),
-                               "vol": lambda v: pct(v, 0), "asym": lambda v: "—" if pd.isna(v) else f"{v:+.2f}".replace(".", ",")}).map(signe_couleur, subset=["momentum", "asym"])
+                               "vol": lambda v: pct(v, 0), "asym": lambda v: "—" if pd.isna(v) else f"{v:+.2f}".replace(".", ","),
+                               "alpha": lambda v: "—" if pd.isna(v) else f"{v:+.1f}".replace(".", ",")}).map(signe_couleur, subset=["momentum", "asym", "alpha"])
             .map(lambda v: f"color:{C_BON};font-weight:600" if v == "Oui" else "", subset=["detenu"]),
             hide_index=True, column_config={"nom": "Titre", "secteur": "Secteur", "place": "Place", "poids": "Poids", "score": "Score",
-                                            "momentum": "Momentum 12-1", "vol": "Volatilité", "asym": "Asym. bêta", "detenu": "Détenu"})
+                                            "momentum": "Momentum 12-1", "vol": "Volatilité", "asym": "Asym. bêta", "alpha": "Alpha (t)", "detenu": "Détenu"})
     if mode in ("mdp", "minvar"):
         st.caption("Ces deux pondérations concentrent les poids sur les titres les moins corrélés : le ratio de diversification monte, mais le HHI se dégrade "
                    f"(poids égaux : {pct(1 / len(titres), 1)}). Les deux sont des critères du concours : « Parité de risque » et « Poids égaux » sont des compromis.")

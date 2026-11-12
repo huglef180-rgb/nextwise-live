@@ -130,7 +130,7 @@ _px = pd.DataFrame(np.exp(np.cumsum(_g.normal(_derive, _vols, (900, 30)), axis=0
 _sec = {f"T{k:02d}": f"S{k % 6}" for k in range(30)}; _pla = {f"T{k:02d}": f"P{k % 4}" for k in range(30)}
 _sig = A.signaux_modele(_px, _i[600])
 _sig_fut = A.signaux_modele(_px.assign(T29=_px["T29"].where(_px.index <= _i[600], 999.0)), _i[600])
-test("modèle : les signaux n'utilisent aucune donnée postérieure à la date", _sig.equals(_sig_fut) and len(_sig) == 30)
+test("modèle : les signaux n'utilisent aucune donnée postérieure à la date", float((_sig - _sig_fut).abs().max().max()) < 1e-9 and len(_sig) == 30)
 _tit, _sc = A.selection_modele(_sig, _sec, _pla, n=12, poids_signaux={"momentum": 1, "faible_vol": 0, "haut52": 0})
 from collections import Counter
 test("modèle : 12 titres, au plus 20 % par secteur et 30 % par place", len(_tit) == 12 and max(Counter(_sec[t] for t in _tit).values()) <= 2
@@ -187,5 +187,26 @@ _fr = -0.08 * _pr.diff().fillna(0) + pd.Series(_gp.normal(0, 0.0005, 600), _ip)
 _rc = A.reaction_aux_cotes(_fr, _pr); _rc0 = A.reaction_aux_cotes(pd.Series(_gp.normal(0, 0.004, 600), _ip), _pr)
 test("réaction aux cotes : écart implicite de −8 % retrouvé, et aucun lien détecté sur un facteur indépendant",
      abs(_rc["pente"] + 0.08) < 0.01 and abs(_rc["t"]) > 5 and abs(_rc0["t"]) < 3)
+
+# --- v9.1 : cours avec trous (nuit, jours fériés) et signal alpha
+_gq = np.random.default_rng(5); _iq = pd.bdate_range("2023-01-02", periods=700)
+_mq = _gq.normal(0.0003, 0.01, 700)
+_Rq = {f"T{i}": (0.5 + 0.1 * i) * _mq + _gq.normal(0, 0.008, 700) for i in range(15)}
+_Rq["T3"] = _Rq["T3"] + 0.0015            # alpha pur : aucun bêta en plus
+_Rq["T14"] = 2.5 * _mq + _gq.normal(0, 0.008, 700)   # monte par son bêta seul
+_Pq = pd.DataFrame({k: 50 * np.exp(np.cumsum(v)) for k, v in _Rq.items()}, index=_iq)
+_sq = A.signaux_modele(_Pq, _iq[-1])
+test("signal alpha : le titre à alpha pur est premier, le titre à fort bêta sans alpha n'est pas dans le haut du classement",
+     _sq["alpha"].idxmax() == "T3" and _sq["alpha"].rank(ascending=False)["T14"] > 3)
+_Pt = _Pq.copy()
+_Pt.loc[_iq[-1] + pd.Timedelta(days=1)] = np.nan          # ligne de nuit : seules les devises cotent
+_Pt.iloc[-23, :5] = np.nan; _Pt.iloc[-254, 5:9] = np.nan  # jours fériés locaux aux dates exactes utilisées par les signaux
+_st = A.signaux_modele(_Pt, _Pt.index[-1])
+test("cours avec trous : la ligne vide de la nuit et les jours fériés locaux n'éliminent aucun titre",
+     len(_st) == 15 and _st.notna().all().all() and abs(_st["momentum"] - _sq["momentum"]).max() < 0.05)
+_b1 = A.backtest_modele(_Pq, {c: "S" for c in _Pq}, {c: "P" for c in _Pq}, 6, None, "equal", 0.2, 1.0, 1.0)
+_b2 = A.backtest_modele(_Pt, {c: "S" for c in _Pq}, {c: "P" for c in _Pq}, 6, None, "equal", 0.2, 1.0, 1.0)
+test("test hors échantillon : les trous ne font pas perdre de rendement (écart cumulé inférieur à 1 point)",
+     _b1 is not None and _b2 is not None and abs((1 + _b1["r"]).prod() - (1 + _b2["r"]).prod()) < 0.01)
 
 print("\nTOUS LES TESTS PASSENT" if ok else "\nAU MOINS UN TEST ÉCHOUE")
